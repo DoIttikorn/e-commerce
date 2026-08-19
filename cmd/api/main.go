@@ -1,4 +1,4 @@
-// Command api runs the user management service.
+// Command api runs the e-commerce service.
 //
 // This file is the only place that knows which concrete adapters are in use.
 // It loads configuration, builds dependencies, starts the servers, and shuts
@@ -16,18 +16,27 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
+	"github.com/DoIttikorn/e-commerce/internal/admin"
 	"github.com/DoIttikorn/e-commerce/internal/config"
 	"github.com/DoIttikorn/e-commerce/internal/database"
+	"github.com/DoIttikorn/e-commerce/internal/logging"
 	"github.com/DoIttikorn/e-commerce/internal/middleware"
 	"github.com/DoIttikorn/e-commerce/internal/router/chirouter"
 )
 
-// startupTimeout bounds how long the service waits for its dependencies
-// before giving up and exiting.
-const startupTimeout = 15 * time.Second
+const (
+	// startupTimeout bounds how long the service waits for its dependencies
+	// before giving up and exiting.
+	startupTimeout = 15 * time.Second
+
+	// readinessTimeout keeps a probe from hanging on a wedged dependency.
+	readinessTimeout = 2 * time.Second
+)
 
 func main() {
 	// Written to stderr rather than through slog: configuration failures
@@ -45,7 +54,7 @@ func run() error {
 		return err
 	}
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	log := logging.New(os.Stdout, cfg.LogLevel)
 	slog.SetDefault(log)
 
 	// ctx is cancelled on SIGINT/SIGTERM and drives shutdown of everything below.
@@ -55,7 +64,7 @@ func run() error {
 	startupCtx, cancelStartup := context.WithTimeout(ctx, startupTimeout)
 	defer cancelStartup()
 
-	db, err := database.NewMongo(startupCtx, cfg.MongoURI, cfg.MongoDatabase)
+	db, err := database.NewMongo(startupCtx, cfg.Mongo.URI, cfg.Mongo.Database)
 	if err != nil {
 		return err
 	}
@@ -66,33 +75,57 @@ func run() error {
 		}
 	}()
 	log.LogAttrs(ctx, slog.LevelInfo, "connected to mongo",
-		slog.String("database", cfg.MongoDatabase))
+		slog.String("database", cfg.Mongo.Database))
+
+	// Redis and Kafka are configured but have no clients yet: they are wired
+	// when a domain needs caching, locking, or events. Logging their state at
+	// startup makes a half-configured environment obvious immediately.
+	log.LogAttrs(ctx, slog.LevelInfo, "optional infrastructure",
+		slog.Bool("redis_configured", cfg.Redis.Enabled()),
+		slog.Bool("kafka_configured", cfg.Kafka.Enabled()),
+	)
+
+	// A dedicated registry rather than the package-level default: no global
+	// state, and the Go and process collectors are registered where they can
+	// be seen, since runtime metrics are most of what performance work needs.
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+	metrics := middleware.NewMetrics(registry)
 
 	r := chirouter.New()
-	r.Use(middleware.Logging(log))
-	r.Handle(http.MethodGet, "/healthz", healthz(db))
+	// Order matters: RequestID first so the metrics and log lines for a request
+	// carry the same correlation ID.
+	r.Use(
+		middleware.RequestID(),
+		metrics.Middleware(),
+		middleware.Logging(log),
+	)
+	r.Handle(http.MethodGet, "/healthz", liveness)
+	r.Handle(http.MethodGet, "/readyz", readiness(db))
 
-	// Domain wiring goes here once the user domain exists:
+	// Domain wiring goes here once a domain exists:
 	//   repo := usermongodb.NewRepository(db)
 	//   svc  := user.NewService(repo, tokens)
 	//   userhandler.New(svc).Register(r)
 
-	srv := &http.Server{
+	apiSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           r.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	adminSrv := &http.Server{
+		Addr:              cfg.AdminAddr,
+		Handler:           admin.NewHandler(registry),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 
-	// ListenAndServe blocks, so it runs in its own goroutine and reports a
-	// startup failure (a taken port, for instance) back through serveErr.
-	serveErr := make(chan error, 1)
-	go func() {
-		log.LogAttrs(ctx, slog.LevelInfo, "http server listening",
-			slog.String("addr", cfg.HTTPAddr))
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serveErr <- fmt.Errorf("http serve: %w", err)
-		}
-	}()
+	// Buffered for both servers so neither goroutine leaks if the other fails first.
+	serveErr := make(chan error, 2)
+	go serve(ctx, log, "api", apiSrv, serveErr)
+	go serve(ctx, log, "admin", adminSrv, serveErr)
 
 	select {
 	case err := <-serveErr:
@@ -106,24 +139,57 @@ func run() error {
 		context.WithoutCancel(ctx), cfg.ShutdownTimeout)
 	defer cancelShutdown()
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("http shutdown: %w", err)
+	// The API drains first so the last requests are still being measured while
+	// the metrics endpoint is up to be scraped one final time.
+	if err := apiSrv.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("api shutdown: %w", err)
+	}
+	if err := adminSrv.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("admin shutdown: %w", err)
 	}
 	return nil
 }
 
-// healthz reports whether the service can still reach MongoDB.
-func healthz(db *mongo.Database) http.HandlerFunc {
+func serve(ctx context.Context, log *slog.Logger, name string, srv *http.Server, errCh chan<- error) {
+	log.LogAttrs(ctx, slog.LevelInfo, "server listening",
+		slog.String("server", name), slog.String("addr", srv.Addr))
+
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		errCh <- fmt.Errorf("%s serve: %w", name, err)
+	}
+}
+
+// liveness answers whether the process is running, and deliberately checks no
+// dependencies.
+//
+// A failing Kubernetes liveness probe restarts the pod, so checking MongoDB
+// here would turn a brief database blip into a restart loop across every
+// instance at once — taking down a service that was only degraded.
+func liveness(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, `{"status":"ok"}`)
+}
+
+// readiness answers whether this instance can serve traffic right now.
+//
+// A failure here removes the instance from the load balancer and leaves it
+// running, which is the right response to a dependency being briefly away: it
+// recovers on its own once MongoDB is reachable again.
+func readiness(db *mongo.Database) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), readinessTimeout)
 		defer cancel()
 
-		w.Header().Set("Content-Type", "application/json")
 		if err := db.Client().Ping(ctx, readpref.Primary()); err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"status":"unavailable"}`))
+			writeJSON(w, http.StatusServiceUnavailable,
+				`{"status":"unavailable","dependency":"mongo"}`)
 			return
 		}
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		writeJSON(w, http.StatusOK, `{"status":"ready"}`)
 	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(body))
 }

@@ -1,3 +1,13 @@
+# Default stack is api + mongo, which is all the code currently needs.
+# Redis and Kafka sit behind the "full" profile:
+#
+#   make docker-run        api + mongo
+#   make docker-run-full   api + mongo + redis + kafka
+#
+# To let the api see them, set REDIS_ADDR=redis:6379 and
+# KAFKA_BROKERS=kafka:9092 in .env. Left unset, the api starts with both
+# features off.
+
 services:
   mongo:
     image: mongo:8.0
@@ -12,6 +22,51 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  redis:
+    image: redis:8-alpine
+    profiles: ["full"]
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  kafka:
+    image: apache/kafka:4.3.1
+    profiles: ["full"]
+    restart: unless-stopped
+    ports:
+      # 9092 is the in-network listener; 29092 is the one host tools can reach.
+      - "29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    environment:
+      # Single-node KRaft: this broker is also the controller, so no ZooKeeper.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+
+      # Two client listeners are needed because a broker advertises the address
+      # clients must dial back on: containers resolve "kafka", the host cannot.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # Replication factors must be 1 on a single broker or topic creation hangs.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
   api:
     build: .
@@ -34,5 +89,13 @@ services:
       JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
       LOG_LEVEL: "info"
 
+      # Empty unless set in .env, so the api's view matches what is running.
+      REDIS_ADDR: "${REDIS_ADDR:-}"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+      KAFKA_BROKERS: "${KAFKA_BROKERS:-}"
+      KAFKA_GROUP_ID: "${KAFKA_GROUP_ID:-ecommerce}"
+
 volumes:
   mongo-data:
+  redis-data:
+  kafka-data:

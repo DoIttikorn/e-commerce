@@ -37,9 +37,13 @@ lint:
 docker-run:
 	@docker compose up --build
 
-## docker-down: stop the stack
+## docker-run-full: also start Redis and Kafka
+docker-run-full:
+	@docker compose --profile full up --build
+
+## docker-down: stop the stack, including profiled services
 docker-down:
-	@docker compose down
+	@docker compose --profile full down
 
 ## watch: live reload via air
 watch:
@@ -55,4 +59,4 @@ clean:
 	@echo "Cleaning..."
 	@rm -f $(BINARY)
 
-.PHONY: all build run test itest proto lint docker-run docker-down watch clean
+.PHONY: all build run test itest proto lint docker-run docker-run-full docker-down watch clean

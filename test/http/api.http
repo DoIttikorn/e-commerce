@@ -1,0 +1,172 @@
+# E-commerce API — manual request collection
+#
+# Written for the VS Code "REST Client" extension. In the JetBrains HTTP Client
+# the requests work unchanged; only the token capture differs — replace the
+# @token line with a response handler:
+#   > {% client.global.set("token", response.body.token) %}
+#
+# STATUS: only /healthz is implemented. Everything below it is the intended
+# contract for the user domain, written ahead of the code on purpose so the
+# request and response shapes are decided before they are built. Expect 404
+# until the domain exists.
+
+@baseUrl = http://localhost:8080
+@contentType = application/json
+
+
+###############################################################################
+# Health — implemented
+###############################################################################
+
+### Liveness and MongoDB reachability.
+# 200 {"status":"ok"}  |  503 {"status":"unavailable"} if Mongo is unreachable
+GET {{baseUrl}}/healthz
+
+
+###############################################################################
+# Auth — not implemented yet
+###############################################################################
+
+### Register a new account. Public.
+# 201 Created
+# {
+#   "id": "665f1c0e5b3a4c001f2d9a11",
+#   "name": "Ittikorn",
+#   "email": "ittikorn@example.com",
+#   "created_at": "2026-08-19T09:00:00Z"
+# }
+#
+# The password hash is never returned, in any response, ever.
+# @name register
+POST {{baseUrl}}/api/v1/auth/register
+Content-Type: {{contentType}}
+
+{
+  "name": "Ittikorn",
+  "email": "ittikorn@example.com",
+  "password": "correct-horse-battery-staple"
+}
+
+### Authenticate and receive a JWT. Public.
+# 200 OK
+# {
+#   "token": "eyJhbGciOiJIUzI1NiIs...",
+#   "expires_at": "2026-08-20T09:00:00Z"
+# }
+# 401 if the email is unknown or the password is wrong — the same response for
+# both, so the endpoint cannot be used to discover which emails are registered.
+# @name login
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: {{contentType}}
+
+{
+  "email": "ittikorn@example.com",
+  "password": "correct-horse-battery-staple"
+}
+
+### Captured from the login response above; run that request first.
+@token = {{login.response.body.token}}
+
+
+###############################################################################
+# Users — not implemented yet. All require a valid JWT.
+###############################################################################
+
+### List users.
+# 200 {"users": [...], "total": 1, "limit": 20, "offset": 0}
+GET {{baseUrl}}/api/v1/users?limit=20&offset=0
+Authorization: Bearer {{token}}
+
+### Fetch one user by ID.
+# 200 with the user, 404 {"error":"user not found"} if the ID does not exist.
+# @name getUser
+GET {{baseUrl}}/api/v1/users/{{register.response.body.id}}
+Authorization: Bearer {{token}}
+
+### Create a user directly, as distinct from self-registration.
+# 201 with the created user.
+POST {{baseUrl}}/api/v1/users
+Authorization: Bearer {{token}}
+Content-Type: {{contentType}}
+
+{
+  "name": "Somchai",
+  "email": "somchai@example.com",
+  "password": "another-long-enough-password"
+}
+
+### Update a user's name or email. Both fields optional; omitted fields are left
+### alone, which is why this is PATCH and not PUT.
+# 200 with the updated user.
+PATCH {{baseUrl}}/api/v1/users/{{register.response.body.id}}
+Authorization: Bearer {{token}}
+Content-Type: {{contentType}}
+
+{
+  "name": "Ittikorn C."
+}
+
+### Delete a user.
+# 204 No Content. Deleting an already-deleted user returns 404.
+DELETE {{baseUrl}}/api/v1/users/{{register.response.body.id}}
+Authorization: Bearer {{token}}
+
+
+###############################################################################
+# Failure cases
+#
+# These matter as much as the happy paths: the brief grades validation and JWT
+# handling, and these are the requests that prove both work.
+###############################################################################
+
+### No token at all. Expect 401, not 500.
+GET {{baseUrl}}/api/v1/users
+
+### Malformed token. Expect 401.
+GET {{baseUrl}}/api/v1/users
+Authorization: Bearer not-a-real-token
+
+### Token signed with the wrong key. Expect 401.
+# Verification must reject this by checking the signing method and signature,
+# not merely by parsing the claims.
+GET {{baseUrl}}/api/v1/users
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NSIsImV4cCI6OTk5OTk5OTk5OX0.invalid-signature-here
+
+### Duplicate email. Expect 409, from the MongoDB unique index rather than a
+### read-then-write check, which would race under concurrent registration.
+POST {{baseUrl}}/api/v1/auth/register
+Content-Type: {{contentType}}
+
+{
+  "name": "Impostor",
+  "email": "ittikorn@example.com",
+  "password": "correct-horse-battery-staple"
+}
+
+### Invalid email and missing name. Expect 400 with per-field detail:
+# {
+#   "error": "validation failed",
+#   "fields": {
+#     "name": "is required",
+#     "email": "must be a valid email address"
+#   }
+# }
+POST {{baseUrl}}/api/v1/auth/register
+Content-Type: {{contentType}}
+
+{
+  "name": "",
+  "email": "not-an-email",
+  "password": "correct-horse-battery-staple"
+}
+
+### Malformed JSON body. Expect 400, never 500.
+POST {{baseUrl}}/api/v1/auth/register
+Content-Type: {{contentType}}
+
+{ "name": "broken",
+
+### Unknown ID format. Expect 400 for a non-ObjectID, 404 for a well-formed one
+### that does not exist — a distinction worth getting right.
+GET {{baseUrl}}/api/v1/users/not-an-object-id
+Authorization: Bearer {{token}}

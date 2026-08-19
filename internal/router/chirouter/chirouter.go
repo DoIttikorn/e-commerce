@@ -15,6 +15,10 @@ import (
 // Router implements router.Router on top of chi.
 type Router struct {
 	mux chi.Router
+
+	// prefix accumulates the enclosing Group prefixes so a route can report its
+	// full pattern, which is what metrics and tracing need as a label.
+	prefix string
 }
 
 var _ router.Router = (*Router)(nil)
@@ -25,12 +29,12 @@ func New() *Router {
 }
 
 func (rt *Router) Handle(method, pattern string, h http.HandlerFunc) {
-	rt.mux.Method(method, pattern, exposePathValues(h))
+	rt.mux.Method(method, pattern, rt.wrap(rt.prefix+pattern, h))
 }
 
 func (rt *Router) Group(prefix string, fn func(router.Router)) {
 	rt.mux.Route(prefix, func(sub chi.Router) {
-		fn(&Router{mux: sub})
+		fn(&Router{mux: sub, prefix: rt.prefix + prefix})
 	})
 }
 
@@ -42,11 +46,14 @@ func (rt *Router) Handler() http.Handler {
 	return rt.mux
 }
 
-// exposePathValues copies the parameters chi captured onto the request, so
-// handlers read them with r.PathValue and never import chi. The "*" key is
-// chi's catch-all rather than a named parameter, so it is skipped.
-func exposePathValues(h http.HandlerFunc) http.Handler {
+// wrap normalises what the rest of the application sees: the matched pattern
+// and the captured parameters, both through router and net/http rather than
+// through chi, so nothing downstream imports a web framework.
+func (rt *Router) wrap(fullPattern string, h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		router.SetPattern(r, fullPattern)
+
+		// The "*" key is chi's catch-all rather than a named parameter.
 		if rc := chi.RouteContext(r.Context()); rc != nil {
 			for i, key := range rc.URLParams.Keys {
 				if key == "*" {
