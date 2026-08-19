@@ -19,10 +19,10 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
-	"github.com/DoIttikorn/user-management-api/internal/config"
-	"github.com/DoIttikorn/user-management-api/internal/database"
-	"github.com/DoIttikorn/user-management-api/internal/middleware"
-	"github.com/DoIttikorn/user-management-api/internal/router/chirouter"
+	"github.com/DoIttikorn/e-commerce/internal/config"
+	"github.com/DoIttikorn/e-commerce/internal/database"
+	"github.com/DoIttikorn/e-commerce/internal/middleware"
+	"github.com/DoIttikorn/e-commerce/internal/router/chirouter"
 )
 
 // startupTimeout bounds how long the service waits for its dependencies

@@ -1,4 +1,4 @@
-module github.com/DoIttikorn/user-management-api
+module github.com/DoIttikorn/e-commerce
 
 go 1.26.6
 

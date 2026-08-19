@@ -53,7 +53,7 @@ jobs:
       - name: Full test suite
         env:
           MONGO_URI: mongodb://localhost:27017
-          MONGO_DATABASE: user_management_test
+          MONGO_DATABASE: ecommerce_test
           JWT_SECRET: ci-only-secret-of-at-least-32-characters
         run: go test -race ./...
 
@@ -63,4 +63,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build image
-        run: docker build -t user-management-api:ci .
+        run: docker build -t ecommerce-api:ci .

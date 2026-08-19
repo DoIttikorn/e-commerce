@@ -38,7 +38,7 @@ func Load() (Config, error) {
 		HTTPAddr:        l.optional("HTTP_ADDR", ":8080"),
 		GRPCAddr:        l.optional("GRPC_ADDR", ":9090"),
 		MongoURI:        l.required("MONGO_URI"),
-		MongoDatabase:   l.optional("MONGO_DATABASE", "user_management"),
+		MongoDatabase:   l.optional("MONGO_DATABASE", "ecommerce"),
 		JWTSecret:       l.required("JWT_SECRET"),
 		JWTTTL:          l.duration("JWT_TTL", 24*time.Hour),
 		ShutdownTimeout: l.duration("SHUTDOWN_TIMEOUT", 15*time.Second),

@@ -5,8 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/DoIttikorn/user-management-api/internal/router"
-	"github.com/DoIttikorn/user-management-api/internal/router/chirouter"
+	"github.com/DoIttikorn/e-commerce/internal/router"
+	"github.com/DoIttikorn/e-commerce/internal/router/chirouter"
 )
 
 // The point of these tests is the port's contract, not chi. They are written

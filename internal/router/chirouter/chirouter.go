@@ -9,7 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/DoIttikorn/user-management-api/internal/router"
+	"github.com/DoIttikorn/e-commerce/internal/router"
 )
 
 // Router implements router.Router on top of chi.
