@@ -1,0 +1,19 @@
+# Build output
+/main
+/api
+
+# Local environment — .env.example is the committed template
+.env
+
+# air live-reload workspace
+tmp/
+
+# Test and coverage output
+*.out
+
+# macOS
+.DS_Store
+
+# local file
+Test-go.md
+Project structure Golang.md

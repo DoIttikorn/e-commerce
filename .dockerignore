@@ -1,0 +1,11 @@
+.git
+.github
+tmp
+docs
+main
+api
+.env
+*.md
+Dockerfile
+.dockerignore
+docker-compose.yml
