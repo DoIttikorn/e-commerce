@@ -15,6 +15,5 @@ tmp/
 .DS_Store
 
 # local file
-Test-go.md
 Project structure Golang.md
 NOTES.local.md

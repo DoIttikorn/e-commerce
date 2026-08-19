@@ -11,16 +11,47 @@
 # until the domain exists.
 
 @baseUrl = http://localhost:8080
+@adminUrl = http://localhost:6060
 @contentType = application/json
 
 
 ###############################################################################
-# Health — implemented
+# Health and operations — implemented
 ###############################################################################
 
-### Liveness and MongoDB reachability.
-# 200 {"status":"ok"}  |  503 {"status":"unavailable"} if Mongo is unreachable
+### Liveness. Always 200 while the process is running, by design: it checks no
+### dependencies, because a failing liveness probe restarts the pod and a
+### database check here would turn a brief Mongo blip into a restart loop.
+# 200 {"status":"ok"}
 GET {{baseUrl}}/healthz
+
+### Readiness. This is where dependency checks belong — a failure removes the
+### instance from the load balancer and leaves it running to recover.
+# 200 {"status":"ready"}
+# 503 {"status":"unavailable","dependency":"mongo"}
+#
+# To see the difference, stop Mongo and call both:
+#   docker compose stop mongo   -> /healthz stays 200, /readyz turns 503
+#   docker compose start mongo  -> /readyz returns to 200 on its own
+GET {{baseUrl}}/readyz
+
+### Any request echoes back its correlation ID, generating one when the caller
+### sends none. The same value appears as request_id on every log line for the
+### request. Values that are over 64 bytes or not printable ASCII are replaced.
+GET {{baseUrl}}/healthz
+X-Request-ID: manual-trace-me-123
+
+### Prometheus metrics. Admin port only — the API port returns 404 for this.
+# Note the route label is the pattern, not the path: hitting /users/1 and
+# /users/2 produces one series, not two.
+GET {{adminUrl}}/metrics
+
+### Heap profile. Admin port only.
+# Analyse with: go tool pprof http://localhost:6060/debug/pprof/heap
+GET {{adminUrl}}/debug/pprof/heap
+
+### Proof the profiler is not exposed publicly: this must be 404.
+GET {{baseUrl}}/debug/pprof/
 
 
 ###############################################################################

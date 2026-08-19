@@ -1,0 +1,156 @@
+# Technology choices
+
+Why each piece of the stack is here, and what it is meant to buy. Written to be
+argued with: where a choice has a real cost, the cost is stated.
+
+## Transport: REST *and* gRPC, not one or the other
+
+The two are not competing options — they serve different callers.
+
+| | REST | gRPC |
+|---|---|---|
+| Direction | north-south: client to system | east-west: service to service |
+| Callers | browsers, mobile apps, partners, curl | other services |
+| Encoding | JSON over HTTP/1.1 | protobuf over HTTP/2 |
+
+REST at the edge, because **a browser cannot speak gRPC natively** — it needs
+grpc-web plus a translating proxy, which is infrastructure to run and debug for
+no gain at the edge. REST is also inspectable with curl, cacheable by ordinary
+proxies, and needs no code generation from whoever consumes it. When something
+is wrong in production at 3am, being able to replay a request by hand matters.
+
+gRPC between services, because that is where the volume is. Internal fan-out
+usually dwarfs external traffic, and there protobuf's smaller payloads and
+cheaper encoding, HTTP/2 connection multiplexing, native streaming, and a
+contract enforced at compile time all pay for themselves.
+
+The hexagonal layout makes this concrete rather than aspirational: `handler/`
+and `gapi/` are two driving adapters over one service, so the same business
+logic serves both without a branch anywhere inside it.
+
+### chi behind a port
+
+`chi` is the router, reached only through `internal/router`. Handlers are plain
+`http.HandlerFunc` and read parameters with `r.PathValue`, so no handler imports
+a framework and swapping to echo is one new adapter file.
+
+The cost is one indirection layer. It is small because the port borrows standard
+library types rather than inventing a `Context` of its own — the trap that turns
+this kind of abstraction into a reimplementation of the framework. The limit is
+that it only works for `net/http`-based frameworks; fiber runs on fasthttp and
+would need a different design, not a stretched version of this one.
+
+## Storage
+
+**MongoDB** is required by the brief. The document model suits a catalogue where
+products carry different attributes per category, and it removes the migration
+step that a relational schema would need for every such change.
+
+Two constraints worth stating before they bite:
+
+- **Multi-document transactions need a replica set.** The single standalone node
+  in `docker-compose.yml` cannot do them. This does not affect the User domain,
+  which writes one document at a time, but Order will need atomicity across an
+  order and its stock decrement — so compose must move to a single-node replica
+  set before that work starts.
+- Uniqueness must be a database index, not an application check. A read-then-write
+  check races under concurrent registration; the unique index is the only thing
+  that actually holds.
+
+**Redis** is configured for caching, distributed locking, rate limiting, and
+idempotency keys. Its most interesting use here is allocation: `SPOP` removes and
+returns a set member atomically, so two concurrent buyers cannot be handed the
+same last item — no lock required. Knowing where an atomic primitive removes the
+need for a lock is most of what "handles high concurrency" means in practice.
+
+**Kafka** is configured for asynchronous workflows: order state changes, audit
+trails, and anything a request should not wait for. It buys decoupling, replay
+after a consumer bug, and consumer-group scaling.
+
+Neither Redis nor Kafka has a Go client yet, on purpose. Both are wired when a
+domain needs them; a dependency with no caller is worse than no dependency.
+
+## Observability
+
+The job description asks for performance tuning, monitoring, troubleshooting,
+and production issue analysis. Those are the things logs alone cannot give you.
+
+| Concern | Tool | Where |
+|---|---|---|
+| Structured logs | `log/slog`, JSON | `internal/logging` |
+| Correlation | request ID, propagated from `X-Request-ID` | `internal/middleware` |
+| Metrics | Prometheus, RED signals + Go runtime | `internal/middleware`, `internal/admin` |
+| Profiling | `net/http/pprof` | `internal/admin` |
+
+**Correlation is done in the slog handler, not at call sites.** A custom
+`slog.Handler` reads the request ID from the context and stamps it on every
+record, so any code that logs with the request context is correlated for free —
+including domain code that knows nothing about HTTP.
+
+**Metrics are labelled by route pattern, never by URL path.** `/users/{id}`
+labelled by path would mint one time series per user ID; unbounded label
+cardinality is the usual way a monitored service takes down the monitoring
+system. Requests matching no route collapse into a single `unmatched` series so
+that a scanner probing random URLs cannot do the same thing.
+
+**pprof and metrics are on a separate port** (`ADMIN_ADDR`, default `:6060`),
+never the public API port. pprof exposes process memory and lets a caller stall
+the process for the duration of a profile, so it must not be reachable from the
+internet. The API port returns 404 for both paths.
+
+Not yet done: **OpenTelemetry tracing**. It is the real answer to debugging a
+call chain across services, and it is the main gap in this list. The logging is
+written so an OTel bridge can be added without touching call sites.
+
+## Availability
+
+**Liveness and readiness are separate endpoints, and the difference matters.**
+
+- `GET /healthz` — liveness. Returns 200 whenever the process is running, and
+  checks no dependencies at all.
+- `GET /readyz` — readiness. Pings MongoDB with a 2 second timeout.
+
+A failing Kubernetes liveness probe *restarts the pod*. Checking the database
+from a liveness endpoint therefore converts a brief MongoDB blip into a restart
+loop across every instance simultaneously, turning a degraded service into an
+outage. A failing readiness probe instead removes the instance from the load
+balancer and leaves it running, so it rejoins by itself once the dependency is
+back. This was verified by stopping MongoDB: liveness stayed 200, readiness
+returned 503, and readiness recovered on its own when MongoDB returned.
+
+**Graceful shutdown** on SIGINT/SIGTERM drains in-flight requests within
+`SHUTDOWN_TIMEOUT`, then disconnects MongoDB. The API server drains before the
+admin server, so the final moments of traffic are still measurable.
+
+**Fail-fast configuration.** Every problem is reported at once at startup, and
+there is no default for the JWT secret or the MongoDB URI. A service that starts
+with a guessed security parameter is worse than one that refuses to start.
+
+## Build and delivery
+
+- **Multi-stage Docker build** onto `distroless/static`: no shell, no package
+  manager, non-root by default, and a smaller attack surface than an Alpine base.
+- **GitHub Actions** runs formatting, vet, unit tests with `-race`, integration
+  tests against a real MongoDB service container, and an image build.
+- **Makefile** is the single entry point, so what passes locally is what CI runs.
+
+## Dependencies
+
+Deliberately few — configuration, JSON, HTTP, and logging are all standard
+library here.
+
+| Module | For |
+|---|---|
+| `github.com/go-chi/chi/v5` | routing, behind `internal/router` |
+| `go.mongodb.org/mongo-driver/v2` | MongoDB |
+| `github.com/prometheus/client_golang` | metrics |
+
+## Known gaps
+
+Honest list, roughly in priority order:
+
+1. OpenTelemetry tracing.
+2. MongoDB replica set in compose, required before Order.
+3. Load testing (k6) — "handles high traffic" is a claim until it is measured.
+4. Rate limiting and circuit breaking, once Redis is wired.
+5. Redis and Kafka clients, when a domain needs them.
