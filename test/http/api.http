@@ -5,8 +5,8 @@
 # @token line with a response handler:
 #   > {% client.global.set("token", response.body.token) %}
 #
-# STATUS: the REST surface is implemented and verified end to end. The gRPC
-# adapter (CreateUser, GetUser) is not built yet.
+# STATUS: implemented and verified end to end. The gRPC surface lives in
+# ../grpc/requests.md — it carries CreateUser and GetUser only, on purpose.
 #
 # Authorization model: reads are open to any authenticated caller; PATCH and
 # DELETE are restricted to the caller's own account and answer 403 otherwise.

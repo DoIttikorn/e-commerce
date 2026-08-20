@@ -9,9 +9,32 @@ import (
 	"github.com/DoIttikorn/e-commerce/internal/config"
 )
 
-// validEnv is the smallest environment Load accepts.
+// configEnv lists every variable Load reads. Tests clear all of them so a
+// result never depends on the shell that started the run — `make itest` and CI
+// both export MONGO_URI and MONGO_DATABASE, and a test that quietly inherits
+// them passes locally and fails in the pipeline.
+var configEnv = []string{
+	"HTTP_ADDR", "GRPC_ADDR", "ADMIN_ADDR",
+	"MONGO_URI", "MONGO_DATABASE",
+	"JWT_SECRET", "JWT_TTL",
+	"SHUTDOWN_TIMEOUT", "LOG_LEVEL",
+	"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB",
+	"KAFKA_BROKERS", "KAFKA_GROUP_ID",
+}
+
+// clearEnv unsets everything for the duration of the test. t.Setenv restores
+// the previous value on cleanup, and Load treats an empty value as unset.
+func clearEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range configEnv {
+		t.Setenv(key, "")
+	}
+}
+
+// validEnv is the smallest environment Load accepts, on an otherwise clean one.
 func validEnv(t *testing.T) {
 	t.Helper()
+	clearEnv(t)
 	t.Setenv("MONGO_URI", "mongodb://localhost:27017")
 	t.Setenv("JWT_SECRET", strings.Repeat("x", 32))
 }
@@ -133,10 +156,11 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if !tt.omitURI {
-				validEnv(t)
-			} else {
+			if tt.omitURI {
+				clearEnv(t)
 				t.Setenv("JWT_SECRET", strings.Repeat("x", 32))
+			} else {
+				validEnv(t)
 			}
 			for k, v := range tt.env {
 				t.Setenv(k, v)
@@ -156,6 +180,7 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 // Load reports every problem at once so a broken environment takes one restart
 // to diagnose rather than one per variable.
 func TestLoadReportsAllProblemsTogether(t *testing.T) {
+	clearEnv(t)
 	t.Setenv("JWT_SECRET", "short")
 	t.Setenv("LOG_LEVEL", "bogus")
 

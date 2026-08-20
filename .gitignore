@@ -1,6 +1,7 @@
-# Build output
+# Build output. Only /main is produced — the Makefile builds `-o main`.
+# Do NOT add /api here: it would match the api/ contract directory, and the
+# generated .pb.go files are meant to be committed.
 /main
-/api
 
 # Local environment — .env.example is the committed template
 .env

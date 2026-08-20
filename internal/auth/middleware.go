@@ -32,7 +32,7 @@ type Verifier interface {
 func Middleware(v Verifier) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			raw, ok := bearerToken(r.Header.Get("Authorization"))
+			raw, ok := BearerToken(r.Header.Get("Authorization"))
 			if !ok {
 				unauthorized(w)
 				return
@@ -51,9 +51,13 @@ func Middleware(v Verifier) func(http.Handler) http.Handler {
 	}
 }
 
-// bearerToken extracts the credential from an Authorization header. The scheme
+// BearerToken extracts the credential from an Authorization value. The scheme
 // is matched case-insensitively, as RFC 7235 requires.
-func bearerToken(header string) (string, bool) {
+//
+// Exported because gRPC carries the same value in metadata rather than a
+// header: where the string comes from is each adapter's business, but the
+// scheme parsing is one rule and belongs in one place.
+func BearerToken(header string) (string, bool) {
 	scheme, token, found := strings.Cut(header, " ")
 	if !found || !strings.EqualFold(scheme, "Bearer") {
 		return "", false

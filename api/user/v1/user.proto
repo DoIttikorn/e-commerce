@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package user.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/DoIttikorn/e-commerce/api/user/v1;userv1";
+
+// UserService is the internal, service-to-service surface for the User domain.
+//
+// It is deliberately not a mirror of the REST API. REST faces browsers and
+// mobile clients; this faces other services, and only carries the operations
+// another service has a reason to call. Registration and login stay out: a
+// service must never authenticate as a user, it propagates the user's token.
+service UserService {
+  // CreateUser provisions an account on behalf of a calling service, for
+  // onboarding and import flows.
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+
+  // GetUser resolves an ID to a user. This is the reason the service exists:
+  // Order, Seller and Product all need to turn a user ID into a name.
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+}
+
+// User is the wire representation.
+//
+// There is no password field, and there never will be. The omission is the
+// guarantee: a hash cannot be serialised into a message that has nowhere to
+// put it.
+message User {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+message CreateUserRequest {
+  string name = 1;
+  string email = 2;
+  string password = 3;
+}
+
+// Responses wrap the payload rather than returning User directly, so a field
+// can be added later without changing the method signature.
+message CreateUserResponse {
+  User user = 1;
+}
+
+message GetUserRequest {
+  string id = 1;
+}
+
+message GetUserResponse {
+  User user = 1;
+}

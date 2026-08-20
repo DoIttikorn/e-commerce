@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,7 +22,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 
+	userv1 "github.com/DoIttikorn/e-commerce/api/user/v1"
 	"github.com/DoIttikorn/e-commerce/internal/admin"
 	"github.com/DoIttikorn/e-commerce/internal/auth"
 	"github.com/DoIttikorn/e-commerce/internal/config"
@@ -30,6 +34,7 @@ import (
 	"github.com/DoIttikorn/e-commerce/internal/middleware"
 	"github.com/DoIttikorn/e-commerce/internal/router/chirouter"
 	"github.com/DoIttikorn/e-commerce/internal/user"
+	usergapi "github.com/DoIttikorn/e-commerce/internal/user/gapi"
 	userhandler "github.com/DoIttikorn/e-commerce/internal/user/handler"
 	usermongo "github.com/DoIttikorn/e-commerce/internal/user/mongodb"
 )
@@ -146,6 +151,26 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// --- gRPC -------------------------------------------------------------
+	//
+	// The second driving adapter over the same service. Nothing in user.Service
+	// changes to support it, which is the whole claim the hexagon makes.
+
+	grpcSrv := grpc.NewServer(
+		grpc.UnaryInterceptor(usergapi.AuthInterceptor(tokens)),
+	)
+	userv1.RegisterUserServiceServer(grpcSrv, usergapi.New(userSvc))
+
+	// Reflection lets grpcurl and similar tools discover the surface without a
+	// copy of the .proto. Worth having in this service; worth reconsidering for
+	// one exposed outside a trusted network.
+	reflection.Register(grpcSrv)
+
+	grpcListener, err := net.Listen("tcp", cfg.GRPCAddr)
+	if err != nil {
+		return fmt.Errorf("grpc listen: %w", err)
+	}
+
 	// --- Background work --------------------------------------------------
 
 	var background sync.WaitGroup
@@ -155,10 +180,17 @@ func run() error {
 		user.NewCountLogger(userSvc, log, countInterval).Run(ctx)
 	}()
 
-	// Buffered for both servers so neither goroutine leaks if the other fails first.
-	serveErr := make(chan error, 2)
+	// Buffered for every server so no goroutine leaks if one fails first.
+	serveErr := make(chan error, 3)
 	go serve(ctx, log, "api", apiSrv, serveErr)
 	go serve(ctx, log, "admin", adminSrv, serveErr)
+	go func() {
+		log.LogAttrs(ctx, slog.LevelInfo, "server listening",
+			slog.String("server", "grpc"), slog.String("addr", cfg.GRPCAddr))
+		if err := grpcSrv.Serve(grpcListener); err != nil {
+			serveErr <- fmt.Errorf("grpc serve: %w", err)
+		}
+	}()
 
 	select {
 	case err := <-serveErr:
@@ -180,6 +212,12 @@ func run() error {
 	if err := adminSrv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("admin shutdown: %w", err)
 	}
+
+	// GracefulStop blocks until in-flight RPCs finish. It has no context, so
+	// the shutdown timeout does not bound it; a wedged RPC would hold the
+	// process open, which is the trade gRPC makes for not cutting off a call
+	// mid-stream.
+	grpcSrv.GracefulStop()
 
 	// Waited on before the deferred Disconnect runs, so the counter cannot be
 	// midway through a query when the client closes underneath it.
