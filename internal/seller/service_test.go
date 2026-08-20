@@ -2,6 +2,7 @@ package seller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -16,14 +17,34 @@ type fakeRepo struct {
 
 	gotSeller Seller
 	gotUpdate Update
+
+	// The events the service handed over with the write. In the real adapter
+	// these commit in the same transaction as the row, so recording them here
+	// is recording what would have been published.
+	recorded []sellerv1.SellerEvent
+	keys     []string
 }
 
-func (f *fakeRepo) Create(ctx context.Context, s Seller) (Seller, error) {
+func (f *fakeRepo) NextID() string { return "seller-1" }
+
+// record decodes what the service asked to be written, so a test can assert on
+// the event rather than on its bytes.
+func (f *fakeRepo) record(events []OutboxEvent) {
+	for _, e := range events {
+		var decoded sellerv1.SellerEvent
+		if err := json.Unmarshal(e.Payload, &decoded); err == nil {
+			f.recorded = append(f.recorded, decoded)
+			f.keys = append(f.keys, e.Key)
+		}
+	}
+}
+
+func (f *fakeRepo) Create(ctx context.Context, s Seller, events []OutboxEvent) (Seller, error) {
 	f.gotSeller = s
 	if f.createFn != nil {
 		return f.createFn(ctx, s)
 	}
-	s.ID = "seller-1"
+	f.record(events)
 	return s, nil
 }
 
@@ -39,11 +60,12 @@ func (f *fakeRepo) List(context.Context, int, int) ([]Seller, int, error) {
 	return []Seller{{ID: "seller-1"}}, 1, nil
 }
 
-func (f *fakeRepo) Update(ctx context.Context, id string, upd Update) (Seller, error) {
+func (f *fakeRepo) Update(ctx context.Context, id string, upd Update, events []OutboxEvent) (Seller, error) {
 	f.gotUpdate = upd
 	if f.updateFn != nil {
 		return f.updateFn(ctx, id, upd)
 	}
+	f.record(events)
 	name := "Shop"
 	if upd.ShopName != nil {
 		name = *upd.ShopName
@@ -51,32 +73,13 @@ func (f *fakeRepo) Update(ctx context.Context, id string, upd Update) (Seller, e
 	return Seller{ID: id, UserID: "owner", ShopName: name, Status: StatusActive}, nil
 }
 
-type fakePublisher struct {
-	published []sellerv1.SellerEvent
-	keys      []string
-	err       error
-}
-
-func (f *fakePublisher) Publish(_ context.Context, _, key string, payload any) error {
-	if f.err != nil {
-		return f.err
-	}
-	event, ok := payload.(sellerv1.SellerEvent)
-	if !ok {
-		return errors.New("unexpected payload type")
-	}
-	f.published = append(f.published, event)
-	f.keys = append(f.keys, key)
-	return nil
-}
-
-func newTestService(repo *fakeRepo, pub *fakePublisher) Service {
-	return NewService(repo, pub, slog.New(slog.DiscardHandler))
+func newTestService(repo *fakeRepo) Service {
+	return NewService(repo, slog.New(slog.DiscardHandler))
 }
 
 func TestRegisterOpensAnActiveShopAndAnnouncesIt(t *testing.T) {
-	repo, pub := &fakeRepo{}, &fakePublisher{}
-	svc := newTestService(repo, pub)
+	repo := &fakeRepo{}
+	svc := newTestService(repo)
 
 	created, err := svc.Register(context.Background(), NewSeller{UserID: "owner", ShopName: "  My Shop  "})
 	if err != nil {
@@ -89,13 +92,13 @@ func TestRegisterOpensAnActiveShopAndAnnouncesIt(t *testing.T) {
 	if created.Status != StatusActive {
 		t.Errorf("status = %q, want %q", created.Status, StatusActive)
 	}
-	if len(pub.published) != 1 || pub.published[0].Type != sellerv1.EventSellerRegistered {
-		t.Fatalf("published = %+v, want one %q event", pub.published, sellerv1.EventSellerRegistered)
+	if len(repo.recorded) != 1 || repo.recorded[0].Type != sellerv1.EventSellerRegistered {
+		t.Fatalf("published = %+v, want one %q event", repo.recorded, sellerv1.EventSellerRegistered)
 	}
 	// The owner must travel with the event, or a consumer cannot answer
 	// "which shop does this account own?" without calling back.
-	if pub.published[0].UserID != "owner" {
-		t.Errorf("event UserID = %q, want the owner", pub.published[0].UserID)
+	if repo.recorded[0].UserID != "owner" {
+		t.Errorf("event UserID = %q, want the owner", repo.recorded[0].UserID)
 	}
 }
 
@@ -113,7 +116,7 @@ func TestRegisterRejectsInvalidInput(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := newTestService(&fakeRepo{}, &fakePublisher{})
+			svc := newTestService(&fakeRepo{})
 
 			_, err := svc.Register(context.Background(), tt.in)
 
@@ -131,24 +134,24 @@ func TestRegisterRejectsInvalidInput(t *testing.T) {
 // The rename event is the one the Product domain depends on: without it every
 // product keeps showing the old shop name forever.
 func TestUpdateAnnouncesTheChangeKeyedBySeller(t *testing.T) {
-	repo, pub := &fakeRepo{}, &fakePublisher{}
-	svc := newTestService(repo, pub)
+	repo := &fakeRepo{}
+	svc := newTestService(repo)
 	newName := "Renamed Shop"
 
 	if _, err := svc.Update(context.Background(), "seller-1", Update{ShopName: &newName}); err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
 
-	if len(pub.published) != 1 {
-		t.Fatalf("published %d events, want 1", len(pub.published))
+	if len(repo.recorded) != 1 {
+		t.Fatalf("published %d events, want 1", len(repo.recorded))
 	}
-	if got := pub.published[0]; got.Type != sellerv1.EventSellerUpdated || got.ShopName != newName {
+	if got := repo.recorded[0]; got.Type != sellerv1.EventSellerUpdated || got.ShopName != newName {
 		t.Errorf("event = %+v, want a %q carrying the new name", got, sellerv1.EventSellerUpdated)
 	}
 	// Keyed by seller ID so two renames of the same shop cannot be applied out
 	// of order by landing on different partitions.
-	if pub.keys[0] != "seller-1" {
-		t.Errorf("partition key = %q, want the seller ID", pub.keys[0])
+	if repo.keys[0] != "seller-1" {
+		t.Errorf("partition key = %q, want the seller ID", repo.keys[0])
 	}
 }
 
@@ -157,40 +160,51 @@ func TestUpdateDoesNotAnnounceAFailedWrite(t *testing.T) {
 	repo := &fakeRepo{updateFn: func(context.Context, string, Update) (Seller, error) {
 		return Seller{}, ErrShopNameTaken
 	}}
-	pub := &fakePublisher{}
 
 	name := "Taken"
-	_, err := newTestService(repo, pub).Update(context.Background(), "seller-1", Update{ShopName: &name})
+	_, err := newTestService(repo).Update(context.Background(), "seller-1", Update{ShopName: &name})
 
 	if !errors.Is(err, ErrShopNameTaken) {
 		t.Errorf("error = %v, want ErrShopNameTaken", err)
 	}
-	if len(pub.published) != 0 {
-		t.Errorf("published %d events after a failed write, want 0", len(pub.published))
+	if len(repo.recorded) != 0 {
+		t.Errorf("published %d events after a failed write, want 0", len(repo.recorded))
 	}
 }
 
-// A publish failure must not fail the request: the write already committed, so
-// reporting an error would describe a success as a failure. The event is lost,
-// which is the limitation a transactional outbox exists to remove.
-func TestUpdateSucceedsWhenPublishingFails(t *testing.T) {
-	pub := &fakePublisher{err: errors.New("kafka unreachable")}
+// Nothing here talks to a broker.
+//
+// This used to be a test that a publish failure did not fail the request, which
+// was the best that could be done when the service published directly: the
+// write had committed, so the error had nowhere useful to go, and the event was
+// lost. With the outbox the question does not arise — the event is handed to
+// the repository with the change and committed beside it, so a broker that is
+// down delays delivery instead of losing it.
+func TestTheEventIsWrittenWithTheChangeRatherThanPublished(t *testing.T) {
+	repo := &fakeRepo{}
 	name := "Renamed"
 
-	updated, err := newTestService(&fakeRepo{}, pub).Update(context.Background(), "seller-1", Update{ShopName: &name})
-
+	updated, err := newTestService(repo).Update(context.Background(), "seller-1", Update{ShopName: &name})
 	if err != nil {
-		t.Fatalf("Update() error = %v, want the write to be reported as the success it was", err)
+		t.Fatalf("Update() error = %v", err)
 	}
 	if updated.ShopName != name {
 		t.Errorf("shop name = %q, want %q", updated.ShopName, name)
+	}
+
+	if len(repo.recorded) != 1 {
+		t.Fatalf("recorded %d events with the write, want 1", len(repo.recorded))
+	}
+	// The event describes the shop after the change, not before it.
+	if repo.recorded[0].ShopName != name {
+		t.Errorf("event shop name = %q, want the new %q", repo.recorded[0].ShopName, name)
 	}
 }
 
 func TestUpdateRejectsAnUnknownStatus(t *testing.T) {
 	bogus := Status("liquidated")
 
-	_, err := newTestService(&fakeRepo{}, &fakePublisher{}).
+	_, err := newTestService(&fakeRepo{}).
 		Update(context.Background(), "seller-1", Update{Status: &bogus})
 
 	var verr *ValidationError
@@ -203,7 +217,7 @@ func TestUpdateRejectsAnUnknownStatus(t *testing.T) {
 }
 
 func TestUpdateRequiresAtLeastOneField(t *testing.T) {
-	_, err := newTestService(&fakeRepo{}, &fakePublisher{}).
+	_, err := newTestService(&fakeRepo{}).
 		Update(context.Background(), "seller-1", Update{})
 
 	var verr *ValidationError

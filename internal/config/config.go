@@ -22,6 +22,11 @@ type Config struct {
 	// be bound to an internal interface; never expose it publicly.
 	AdminAddr string
 
+	// ProductGRPCAddr is where the Product service answers stock reservations.
+	// Only the Order service uses it, and it fails fast at startup if a service
+	// that needs it has none.
+	ProductGRPCAddr string
+
 	JWTSecret       string
 	JWTTTL          time.Duration
 	ShutdownTimeout time.Duration
@@ -78,6 +83,7 @@ func Load() (Config, error) {
 		HTTPAddr:        l.optional("HTTP_ADDR", ":8080"),
 		GRPCAddr:        l.optional("GRPC_ADDR", ":9090"),
 		AdminAddr:       l.optional("ADMIN_ADDR", ":6060"),
+		ProductGRPCAddr: os.Getenv("PRODUCT_GRPC_ADDR"),
 		JWTSecret:       l.required("JWT_SECRET"),
 		JWTTTL:          l.duration("JWT_TTL", 24*time.Hour),
 		ShutdownTimeout: l.duration("SHUTDOWN_TIMEOUT", 15*time.Second),

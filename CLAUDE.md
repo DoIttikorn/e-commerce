@@ -6,10 +6,12 @@ Guidance for Claude Code when working in this repository.
 
 An e-commerce backend in Go: one binary per domain, sharing a repository.
 
-Three services exist — `user`, `seller`, `product` — each independently
-deployable, each owning its own MongoDB database. They do not call each other
-and do not read each other's collections; the only line between them is a Kafka
-event stream. [docs/domains.md](docs/domains.md) is the map.
+Six services exist — `user`, `seller`, `product`, `order`, `marketplace`,
+`live` — each independently deployable, each owning **its own MongoDB
+instance**. They communicate through Kafka events, with exactly one exception:
+Order calls Product over gRPC to reserve stock, because a buyer cannot be told
+their order exists until the stock is secured.
+[docs/domains.md](docs/domains.md) is the map.
 
 - Module path: `github.com/DoIttikorn/e-commerce`
 - Go: 1.26.x (1.26.6 installed locally)
@@ -24,6 +26,9 @@ Committed context:
 
 - [Test-go.md](Test-go.md) — the role this work is aimed at. Its Responsibilities
   and Qualifications explain why the stack looks the way it does.
+- [docs/highlights.md](docs/highlights.md) — the shortest useful description of
+  what this system does and which parts are load-bearing. Read it before
+  changing anything structural.
 - [docs/](docs/) — design artefacts and technology decisions.
 
 Local-only, not committed (see `.gitignore`):
@@ -35,7 +40,7 @@ Local-only, not committed (see `.gitignore`):
 
 ## Current state
 
-**Three domains are built, wired, and verified end to end: User, Seller, Product.**
+**All six domains are built, wired, and verified end to end.**
 
 In place and passing `make lint` and `make test`:
 
@@ -58,7 +63,15 @@ In place and passing `make lint` and `make test`:
   `CountLogger`
 - `internal/seller` — shops; publishes `seller.registered` and `seller.updated`
 - `internal/product` — listings; consumes seller events into a local read model,
-  and caches reads through a `rediscache` decorator over the `Repository` port
+  caches reads through a `rediscache` decorator, and serves stock reservation
+  over gRPC
+- `internal/order` — the saga: reserve over gRPC, write order and event in one
+  transaction, compensate on failure. The only user of `internal/outbox`
+- `internal/marketplace` — a search projection fed by three event streams, with
+  a MongoDB text index and a TTL search cache
+- `internal/live` — streams, WebSocket viewers, and Redis-backed presence and
+  broadcast so both work across instances
+- `internal/outbox` — transactional outbox and its relay
 - `internal/auth` — bcrypt hashing, HS256 issue/verify, bearer middleware
 - `api/user/v1` — `user.proto` plus generated, committed Go code
 - `test/integration` — repository tests against a real MongoDB (including the
@@ -66,8 +79,8 @@ In place and passing `make lint` and `make test`:
 - `test/http/api.http`, `test/grpc/requests.md` — request collections for both
   protocols, doubling as the brief's sample requests deliverable
 
-Not written yet: `README.md`, `docs/lottery-search-design.md`, and the Order,
-Marketplace and Live Commerce domains.
+Not written yet: `docs/lottery-search-design.md`. Known gaps in what is built
+are listed in [docs/domains.md](docs/domains.md).
 
 ### Design before domain
 
@@ -255,10 +268,34 @@ Rules that come from things that have already bitten:
 - **Consumer lag is the metric that matters.** `make kafka-ui` shows it per
   group; a lag that climbs means the consumer is losing to the producer, and
   every health check will still be green.
-- **Publishing happens after the write and cannot fail it.** The write is already
-  committed, so a publish error is logged, not returned. This loses the event —
-  the fix is a transactional outbox, and it is the first thing to add when this
-  stops being a demonstration.
+- **Never publish from a request path.** Events are written into the same
+  transaction as the change that produced them, and a relay publishes them
+  afterwards. A service that publishes directly can succeed at the write and
+  fail at the publish, and the event is then lost with no way to detect it.
+  `internal/outbox` is generic; use it. Full reasoning in
+  [docs/transactional-outbox.md](docs/transactional-outbox.md).
+- **The exception is an event whose value decays to nothing.** `internal/live`
+  publishes to Redis pub/sub with no outbox on purpose: a delivery guarantee for
+  a notification that is worthless when stale is machinery for nothing.
+
+### Distributed writes
+
+- **There is no transaction across services.** Each owns its own MongoDB
+  instance, so anything spanning two of them is a **saga**: act, then compensate
+  if a later step fails. `internal/order` is the worked example.
+- **Prefer an atomic conditional update to a lock.** Reserving stock is
+  `{_id, stock: {$gte: n}}` with `$inc` — the server matches and decrements in
+  one step, so two buyers racing for the last unit cannot both succeed. No lock,
+  no read-then-write, no contention beyond the document itself.
+- **Every cross-service write takes an idempotency key.** A caller that times
+  out cannot tell whether the server acted, so it will retry. The key is what
+  makes the retry safe; without one, "reserve stock" becomes "reserve stock
+  twice" on a bad network.
+- **A compensating action must be safe to call repeatedly**, because it runs on
+  the path where retries happen.
+- **Never commit a transaction that already contains a failed write.** The
+  commit fails with a retryable label, `WithTransaction` retries, and the call
+  spins until its context expires. Handle the duplicate outside the transaction.
 
 ### Caching
 
@@ -319,6 +356,25 @@ adapter** — that is the cheapest possible proof a swap is safe.
   If fiber becomes a real target, revisit this design rather than stretching it.
 - Framework-specific middleware does not transfer. Write project middleware in
   the stdlib shape; use framework-provided middleware only inside the adapter.
+
+### Realtime
+
+Only `internal/live` has this shape, and everything in it follows from one fact:
+a WebSocket lives on exactly one instance.
+
+- **Nothing that has to be true for all viewers may live in process memory.**
+  Viewer counts and broadcasts both go through Redis, or a second instance makes
+  both wrong.
+- **Presence must expire.** Nobody sends a goodbye when a laptop lid closes.
+  Score viewers by timestamp, prune on read, and heartbeat from the socket.
+- **Read from the socket even when the client sends nothing.** A WebSocket close
+  only surfaces through a read; a handler that never reads never learns the
+  viewer left.
+- **Redis pub/sub, not Kafka, for live events.** It has no replay, which is
+  correct for a feed whose value decays in seconds and wrong for anything
+  durable.
+- **Drop frames for a slow viewer rather than blocking.** One stalled connection
+  must not hold up everyone sharing the process.
 
 ## Go conventions
 
@@ -457,7 +513,7 @@ Conventions:
 ```bash
 make                        # list every target
 make run                    # go run ./cmd/user
-make run SERVICE=product    # or any other service
+make run SERVICE=product    # user | seller | product | order | marketplace | live
 make watch SERVICE=seller   # live reload one service
 make build                  # every binary into ./bin
 
@@ -555,22 +611,26 @@ A design document only — **do not write implementation code for it.** It goes 
 
 ## E-commerce roadmap
 
-Built: User, Seller, Product. To come, in dependency order: **Order**,
-Marketplace, Live Commerce. [docs/domains.md](docs/domains.md) has the map and
-the reasoning.
+All six are built. [docs/domains.md](docs/domains.md) has the map, the
+reasoning, and the known gaps.
 
 Each arrives as a full domain package per [Adding a domain](#adding-a-domain).
 
 Redis and Kafka are wired, in `internal/database/redis.go` and `internal/kafka/`
 per the house convention. Both remain optional to the platform: a service that
-genuinely needs one says so at startup rather than failing on first use, which
-is what `cmd/seller` and `cmd/product` do with `KAFKA_BROKERS`.
+genuinely needs one says so at startup rather than failing on first use.
 
-**Blocker to clear before Order:** MongoDB multi-document transactions require a
-replica set, and `docker-compose.yml` runs a single standalone node. Writing an
-order and decrementing stock atomically will fail there. Move compose to a
-single-node replica set (`--replSet rs0` plus `rs.initiate()`) as the first step
-of that work, not as a surprise in the middle of it.
+Note the difference between the two uses of Redis. In `product` and
+`marketplace` it is a cache and genuinely optional — unset `REDIS_ADDR` and they
+run identically, only slower. In `live` it is **required**, because presence and
+broadcast are shared state rather than a cache: two instances without it would
+each have their own idea of the audience and both would be wrong.
+
+Every MongoDB instance is a **single-node replica set**, which transactions and
+change streams both require. From inside the compose network use the set name;
+from the host use `directConnection=true`, because each set advertises its
+member as `mongo-<service>:27017` — a name that resolves in the network and
+nowhere else.
 
 ## Working notes for Claude
 

@@ -11,6 +11,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/DoIttikorn/e-commerce/internal/outbox"
 	"github.com/DoIttikorn/e-commerce/internal/product"
 )
 
@@ -43,16 +44,50 @@ func (d document) toDomain() product.Product {
 	}
 }
 
+// OutboxName is where this domain's pending events live.
+const OutboxName = outbox.CollectionName
+
 // Repository implements product.Repository.
 type Repository struct {
-	coll *mongo.Collection
+	db      *mongo.Database
+	coll    *mongo.Collection
+	outboxC *mongo.Collection
 }
 
 var _ product.Repository = (*Repository)(nil)
 
 // NewRepository returns a Repository over db's products collection.
 func NewRepository(db *mongo.Database) *Repository {
-	return &Repository{coll: db.Collection(CollectionName)}
+	return &Repository{
+		db:      db,
+		coll:    db.Collection(CollectionName),
+		outboxC: db.Collection(OutboxName),
+	}
+}
+
+// NextID mints an ObjectID up front, so the event written beside a product can
+// carry its ID rather than being patched after the fact.
+func (r *Repository) NextID() string { return bson.NewObjectID().Hex() }
+
+// inTransaction runs fn inside a session transaction.
+func (r *Repository) inTransaction(ctx context.Context, fn func(context.Context) (any, error)) (any, error) {
+	session, err := r.db.Client().StartSession()
+	if err != nil {
+		return nil, fmt.Errorf("start session: %w", err)
+	}
+	defer session.EndSession(ctx)
+
+	return session.WithTransaction(ctx, fn)
+}
+
+func toOutboxEvents(events []product.OutboxEvent) []outbox.Event {
+	out := make([]outbox.Event, 0, len(events))
+	for _, e := range events {
+		out = append(out, outbox.Event{
+			Topic: e.Topic, Key: e.Key, Payload: e.Payload, CreatedAt: e.CreatedAt,
+		})
+	}
+	return out
 }
 
 // EnsureIndexes creates the indexes the query patterns need.
@@ -76,11 +111,30 @@ func (r *Repository) EnsureIndexes(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create product indexes: %w", err)
 	}
-	return nil
+
+	// Reservations are keyed by the caller's idempotency key, so _id is already
+	// unique. This index expires them: a reservation record is only needed for
+	// as long as a retry might arrive, and keeping them forever grows a
+	// collection nobody reads.
+	_, err = r.reservations().Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "created_at", Value: 1}},
+		Options: options.Index().SetName("ttl_created").SetExpireAfterSeconds(7 * 24 * 60 * 60),
+	})
+	if err != nil {
+		return fmt.Errorf("create reservation index: %w", err)
+	}
+	return outbox.EnsureIndexes(ctx, r.outboxC)
 }
 
-func (r *Repository) Create(ctx context.Context, p product.Product) (product.Product, error) {
+// Create writes the product and its events in one transaction.
+func (r *Repository) Create(ctx context.Context, p product.Product, events []product.OutboxEvent) (product.Product, error) {
+	oid, err := bson.ObjectIDFromHex(p.ID)
+	if err != nil {
+		return product.Product{}, product.ErrInvalidID
+	}
+
 	doc := document{
+		ID:          oid,
 		SellerID:    p.SellerID,
 		SellerName:  p.SellerName,
 		Name:        p.Name,
@@ -91,17 +145,21 @@ func (r *Repository) Create(ctx context.Context, p product.Product) (product.Pro
 		CreatedAt:   p.CreatedAt,
 	}
 
-	res, err := r.coll.InsertOne(ctx, doc)
+	out, err := r.inTransaction(ctx, func(sc context.Context) (any, error) {
+		if _, err := r.coll.InsertOne(sc, doc); err != nil {
+			return nil, err
+		}
+		if err := outbox.Append(sc, r.outboxC, toOutboxEvents(events)); err != nil {
+			return nil, err
+		}
+		return doc.toDomain(), nil
+	})
 	if err != nil {
 		return product.Product{}, fmt.Errorf("insert product: %w", err)
 	}
 
-	id, ok := res.InsertedID.(bson.ObjectID)
-	if !ok {
-		return product.Product{}, fmt.Errorf("insert product: unexpected id type %T", res.InsertedID)
-	}
-	doc.ID = id
-	return doc.toDomain(), nil
+	created, _ := out.(product.Product)
+	return created, nil
 }
 
 func (r *Repository) ByID(ctx context.Context, id string) (product.Product, error) {
@@ -151,7 +209,8 @@ func (r *Repository) List(ctx context.Context, sellerID string, limit, offset in
 	return products, int(total), nil
 }
 
-func (r *Repository) Update(ctx context.Context, id string, upd product.Update) (product.Product, error) {
+// Update writes the change and its events in one transaction.
+func (r *Repository) Update(ctx context.Context, id string, upd product.Update, events []product.OutboxEvent) (product.Product, error) {
 	oid, err := bson.ObjectIDFromHex(id)
 	if err != nil {
 		return product.Product{}, product.ErrInvalidID
@@ -174,12 +233,20 @@ func (r *Repository) Update(ctx context.Context, id string, upd product.Update) 
 		return r.ByID(ctx, id)
 	}
 
-	var doc document
-	err = r.coll.FindOneAndUpdate(ctx,
-		bson.M{"_id": oid},
-		bson.M{"$set": set},
-		options.FindOneAndUpdate().SetReturnDocument(options.After),
-	).Decode(&doc)
+	out, err := r.inTransaction(ctx, func(sc context.Context) (any, error) {
+		var doc document
+		if err := r.coll.FindOneAndUpdate(sc,
+			bson.M{"_id": oid},
+			bson.M{"$set": set},
+			options.FindOneAndUpdate().SetReturnDocument(options.After),
+		).Decode(&doc); err != nil {
+			return nil, err
+		}
+		if err := outbox.Append(sc, r.outboxC, toOutboxEvents(events)); err != nil {
+			return nil, err
+		}
+		return doc.toDomain(), nil
+	})
 
 	switch {
 	case errors.Is(err, mongo.ErrNoDocuments):
@@ -187,21 +254,34 @@ func (r *Repository) Update(ctx context.Context, id string, upd product.Update) 
 	case err != nil:
 		return product.Product{}, fmt.Errorf("update product: %w", err)
 	}
-	return doc.toDomain(), nil
+
+	updated, _ := out.(product.Product)
+	return updated, nil
 }
 
-func (r *Repository) Delete(ctx context.Context, id string) error {
+// Delete removes the product and records its delisting in one transaction.
+func (r *Repository) Delete(ctx context.Context, id string, events []product.OutboxEvent) error {
 	oid, err := bson.ObjectIDFromHex(id)
 	if err != nil {
 		return product.ErrInvalidID
 	}
 
-	res, err := r.coll.DeleteOne(ctx, bson.M{"_id": oid})
+	_, err = r.inTransaction(ctx, func(sc context.Context) (any, error) {
+		res, err := r.coll.DeleteOne(sc, bson.M{"_id": oid})
+		if err != nil {
+			return nil, err
+		}
+		if res.DeletedCount == 0 {
+			return nil, product.ErrProductNotFound
+		}
+		return nil, outbox.Append(sc, r.outboxC, toOutboxEvents(events))
+	})
+
+	if errors.Is(err, product.ErrProductNotFound) {
+		return err
+	}
 	if err != nil {
 		return fmt.Errorf("delete product: %w", err)
-	}
-	if res.DeletedCount == 0 {
-		return product.ErrProductNotFound
 	}
 	return nil
 }

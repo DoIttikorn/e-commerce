@@ -10,19 +10,131 @@
 # enforces rather than something a code review has to catch.
 
 services:
-  mongo:
+  # One MongoDB per service, not one shared instance with three databases.
+  #
+  # Separate databases already stopped a service reading another's collections.
+  # Separate instances go further and remove the things a shared server keeps
+  # shared regardless of database: connection limits, cache, lock contention,
+  # a backup and restore schedule, a version upgrade, and a failure. A slow
+  # aggregate in the catalogue should not lengthen a login.
+  #
+  # Each is a single-node replica set, because transactions and change streams
+  # both need an oplog. One node buys no redundancy; production runs three.
+  #
+  # Host ports differ so integration tests can reach each one directly.
+  mongo-user:
     image: mongo:8.0
     restart: unless-stopped
+    command: ["--replSet", "rs-user", "--bind_ip_all"]
     ports:
       - "27017:27017"
     volumes:
-      - mongo-data:/data/db
+      - mongo-user-data:/data/db
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
+      test: >-
+        mongosh --quiet --eval "
+          try { rs.status().ok }
+          catch (e) { rs.initiate({_id:'rs-user',members:[{_id:0,host:'mongo-user:27017'}]}) }
+        "
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  mongo-seller:
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["--replSet", "rs-seller", "--bind_ip_all"]
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo-seller-data:/data/db
+    healthcheck:
+      test: >-
+        mongosh --quiet --eval "
+          try { rs.status().ok }
+          catch (e) { rs.initiate({_id:'rs-seller',members:[{_id:0,host:'mongo-seller:27017'}]}) }
+        "
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  mongo-product:
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["--replSet", "rs-product", "--bind_ip_all"]
+    ports:
+      - "27019:27017"
+    volumes:
+      - mongo-product-data:/data/db
+    healthcheck:
+      test: >-
+        mongosh --quiet --eval "
+          try { rs.status().ok }
+          catch (e) { rs.initiate({_id:'rs-product',members:[{_id:0,host:'mongo-product:27017'}]}) }
+        "
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  mongo-order:
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["--replSet", "rs-order", "--bind_ip_all"]
+    ports:
+      - "27020:27017"
+    volumes:
+      - mongo-order-data:/data/db
+    healthcheck:
+      test: >-
+        mongosh --quiet --eval "
+          try { rs.status().ok }
+          catch (e) { rs.initiate({_id:'rs-order',members:[{_id:0,host:'mongo-order:27017'}]}) }
+        "
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  mongo-marketplace:
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["--replSet", "rs-marketplace", "--bind_ip_all"]
+    ports:
+      - "27021:27017"
+    volumes:
+      - mongo-marketplace-data:/data/db
+    healthcheck:
+      test: >-
+        mongosh --quiet --eval "
+          try { rs.status().ok }
+          catch (e) { rs.initiate({_id:'rs-marketplace',members:[{_id:0,host:'mongo-marketplace:27017'}]}) }
+        "
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  mongo-live:
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["--replSet", "rs-live", "--bind_ip_all"]
+    ports:
+      - "27022:27017"
+    volumes:
+      - mongo-live-data:/data/db
+    healthcheck:
+      test: >-
+        mongosh --quiet --eval "
+          try { rs.status().ok }
+          catch (e) { rs.initiate({_id:'rs-live',members:[{_id:0,host:'mongo-live:27017'}]}) }
+        "
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
 
   redis:
     image: redis:8-alpine
@@ -100,15 +212,15 @@ services:
         SERVICE: user
     restart: unless-stopped
     depends_on:
-      mongo:
+      mongo-user:
         condition: service_healthy
     ports:
       - "8080:8080"   # REST
       - "9090:9090"   # gRPC
       - "6060:6060"   # metrics and pprof — internal only in a real deployment
     environment:
-      MONGO_URI: "mongodb://mongo:27017"
-      MONGO_DATABASE: "ecommerce_user"
+      MONGO_URI: "mongodb://mongo-user:27017/?replicaSet=rs-user"
+      MONGO_DATABASE: "ecommerce"
       JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
       LOG_LEVEL: "info"
 
@@ -119,7 +231,7 @@ services:
         SERVICE: seller
     restart: unless-stopped
     depends_on:
-      mongo:
+      mongo-seller:
         condition: service_healthy
       kafka:
         condition: service_healthy
@@ -127,8 +239,8 @@ services:
       - "8081:8080"
       - "6061:6060"
     environment:
-      MONGO_URI: "mongodb://mongo:27017"
-      MONGO_DATABASE: "ecommerce_seller"
+      MONGO_URI: "mongodb://mongo-seller:27017/?replicaSet=rs-seller"
+      MONGO_DATABASE: "ecommerce"
       # Same secret as the user service: it verifies tokens the user service
       # issued. In production this is where an asymmetric key pair earns its
       # keep — the issuer holds the private key and nobody else can mint tokens.
@@ -144,7 +256,7 @@ services:
         SERVICE: product
     restart: unless-stopped
     depends_on:
-      mongo:
+      mongo-product:
         condition: service_healthy
       kafka:
         condition: service_healthy
@@ -154,8 +266,8 @@ services:
       - "8082:8080"
       - "6062:6060"
     environment:
-      MONGO_URI: "mongodb://mongo:27017"
-      MONGO_DATABASE: "ecommerce_product"
+      MONGO_URI: "mongodb://mongo-product:27017/?replicaSet=rs-product"
+      MONGO_DATABASE: "ecommerce"
       JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
       KAFKA_BROKERS: "kafka:9092"
       # A group of its own: sharing one with the seller service would have them
@@ -165,7 +277,96 @@ services:
       REDIS_TTL: "5m"
       LOG_LEVEL: "info"
 
+  order:
+    build:
+      context: .
+      args:
+        SERVICE: order
+    restart: unless-stopped
+    depends_on:
+      mongo-order:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      product:
+        condition: service_started
+    ports:
+      - "8083:8080"
+      - "6063:6060"
+    environment:
+      MONGO_URI: "mongodb://mongo-order:27017/?replicaSet=rs-order"
+      MONGO_DATABASE: "ecommerce"
+      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_GROUP_ID: "order-service"
+      # The one synchronous dependency in the system. Reachable inside the
+      # network only: product publishes no gRPC port to the host.
+      PRODUCT_GRPC_ADDR: "product:9090"
+      LOG_LEVEL: "info"
+
+  marketplace:
+    build:
+      context: .
+      args:
+        SERVICE: marketplace
+    restart: unless-stopped
+    depends_on:
+      mongo-marketplace:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8084:8080"
+      - "6064:6060"
+    environment:
+      MONGO_URI: "mongodb://mongo-marketplace:27017/?replicaSet=rs-marketplace"
+      MONGO_DATABASE: "ecommerce"
+      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
+      KAFKA_BROKERS: "kafka:9092"
+      # Each stream gets its own group, derived from this prefix, so a backlog
+      # on one cannot hold up the others.
+      KAFKA_GROUP_ID: "marketplace"
+      REDIS_ADDR: "redis:6379"
+      # Short: search results have no key to invalidate by, so staleness is
+      # bounded by time rather than removed.
+      REDIS_TTL: "30s"
+      LOG_LEVEL: "info"
+
+  live:
+    build:
+      context: .
+      args:
+        SERVICE: live
+    restart: unless-stopped
+    depends_on:
+      mongo-live:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8085:8080"
+      - "6065:6060"
+    environment:
+      MONGO_URI: "mongodb://mongo-live:27017/?replicaSet=rs-live"
+      MONGO_DATABASE: "ecommerce"
+      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_GROUP_ID: "live"
+      # Required, not optional: presence and broadcast are shared state. Two
+      # instances without it would each have their own idea of the audience.
+      REDIS_ADDR: "redis:6379"
+      LOG_LEVEL: "info"
+
 volumes:
-  mongo-data:
+  mongo-user-data:
+  mongo-seller-data:
+  mongo-product-data:
+  mongo-order-data:
+  mongo-marketplace-data:
+  mongo-live-data:
   redis-data:
   kafka-data:

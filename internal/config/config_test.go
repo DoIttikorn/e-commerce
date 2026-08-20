@@ -14,7 +14,7 @@ import (
 // both export MONGO_URI and MONGO_DATABASE, and a test that quietly inherits
 // them passes locally and fails in the pipeline.
 var configEnv = []string{
-	"HTTP_ADDR", "GRPC_ADDR", "ADMIN_ADDR",
+	"HTTP_ADDR", "GRPC_ADDR", "ADMIN_ADDR", "PRODUCT_GRPC_ADDR",
 	"MONGO_URI", "MONGO_DATABASE",
 	"JWT_SECRET", "JWT_TTL",
 	"SHUTDOWN_TIMEOUT", "LOG_LEVEL",

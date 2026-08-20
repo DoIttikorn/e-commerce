@@ -50,7 +50,36 @@ var (
 
 	// ErrNotOwner means the caller does not own the shop this product is in.
 	ErrNotOwner = errors.New("this product belongs to another shop")
+
+	// ErrInsufficientStock means at least one line could not be satisfied. It
+	// carries no detail about which: a reservation is all-or-nothing, so a
+	// partial answer would be misleading.
+	ErrInsufficientStock = errors.New("insufficient stock")
+
+	// ErrMixedSellers means the lines span more than one shop. An order belongs
+	// to one seller, so splitting a basket is the caller's job.
+	ErrMixedSellers = errors.New("all items must belong to one seller")
 )
+
+// ReserveItem is one line of a reservation request.
+type ReserveItem struct {
+	ProductID string
+	Quantity  int
+}
+
+// ReservedItem is what was actually taken.
+//
+// It carries the name and price as they were at the moment of reservation.
+// The order snapshots them: a product repriced tomorrow must not change what
+// somebody agreed to pay today.
+type ReservedItem struct {
+	ProductID   string
+	ProductName string
+	SellerID    string
+	UnitMinor   int64
+	Currency    string
+	Quantity    int
+}
 
 // ValidationError reports which fields were rejected and why.
 type ValidationError struct {

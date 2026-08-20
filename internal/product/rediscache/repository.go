@@ -40,6 +40,10 @@ type Repository struct {
 
 var _ product.Repository = (*Repository)(nil)
 
+// NextID is passed straight through: minting an identifier is the store's job,
+// and a cache has no opinion about it.
+func (r *Repository) NextID() string { return r.inner.NextID() }
+
 // New returns a caching Repository. Registering the counters here makes the
 // cache measurable: a cache whose hit rate nobody can see is a guess.
 func New(
@@ -137,8 +141,8 @@ func (r *Repository) drop(ctx context.Context, ids ...string) {
 
 // Create writes through the inner repository. There is nothing to invalidate:
 // the product did not exist, so nothing can be cached under its ID.
-func (r *Repository) Create(ctx context.Context, p product.Product) (product.Product, error) {
-	return r.inner.Create(ctx, p)
+func (r *Repository) Create(ctx context.Context, p product.Product, events []product.OutboxEvent) (product.Product, error) {
+	return r.inner.Create(ctx, p, events)
 }
 
 // Update invalidates rather than rewrites.
@@ -147,8 +151,8 @@ func (r *Repository) Create(ctx context.Context, p product.Product) (product.Pro
 // makes two writers racing able to leave the cache holding the older of two
 // values indefinitely. Deleting means the next read repopulates from the
 // source of truth.
-func (r *Repository) Update(ctx context.Context, id string, upd product.Update) (product.Product, error) {
-	updated, err := r.inner.Update(ctx, id, upd)
+func (r *Repository) Update(ctx context.Context, id string, upd product.Update, events []product.OutboxEvent) (product.Product, error) {
+	updated, err := r.inner.Update(ctx, id, upd, events)
 	if err != nil {
 		return product.Product{}, err
 	}
@@ -156,8 +160,8 @@ func (r *Repository) Update(ctx context.Context, id string, upd product.Update) 
 	return updated, nil
 }
 
-func (r *Repository) Delete(ctx context.Context, id string) error {
-	if err := r.inner.Delete(ctx, id); err != nil {
+func (r *Repository) Delete(ctx context.Context, id string, events []product.OutboxEvent) error {
+	if err := r.inner.Delete(ctx, id, events); err != nil {
 		return err
 	}
 	r.drop(ctx, id)
@@ -185,4 +189,52 @@ func (r *Repository) RenameSeller(ctx context.Context, sellerID, shopName string
 	}
 	r.drop(ctx, affected...)
 	return affected, nil
+}
+
+// Reserve takes stock and drops every product it touched from the cache.
+//
+// Stock is part of the cached document, so a reservation that did not
+// invalidate would leave the catalogue advertising units that are already
+// spoken for — the one kind of staleness a shopper notices immediately.
+func (r *Repository) Reserve(ctx context.Context, key string, items []product.ReserveItem) ([]product.ReservedItem, error) {
+	reserved, err := r.inner.Reserve(ctx, key, items)
+	if err != nil {
+		// Some lines may have been taken and rolled back inside the
+		// transaction, so invalidate what was asked for rather than what came
+		// back. Dropping a key that was never stale costs one round trip.
+		r.drop(ctx, productIDs(items)...)
+		return nil, err
+	}
+
+	r.drop(ctx, reservedIDs(reserved)...)
+	return reserved, nil
+}
+
+// Release puts stock back and invalidates the same way.
+func (r *Repository) Release(ctx context.Context, key string, items []product.ReserveItem) error {
+	if err := r.inner.Release(ctx, key, items); err != nil {
+		return err
+	}
+
+	// The release path knows the key, not necessarily the items: the inner
+	// repository looks them up. Invalidating what the caller named covers the
+	// case where it does know, and the TTL covers the rest.
+	r.drop(ctx, productIDs(items)...)
+	return nil
+}
+
+func productIDs(items []product.ReserveItem) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ProductID)
+	}
+	return ids
+}
+
+func reservedIDs(items []product.ReservedItem) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ProductID)
+	}
+	return ids
 }

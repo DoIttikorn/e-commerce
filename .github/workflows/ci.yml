@@ -32,54 +32,6 @@ jobs:
   integration:
     name: Integration tests
     runs-on: ubuntu-latest
-    services:
-      mongo:
-        image: mongo:8.0
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand(\"ping\")'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      redis:
-        image: redis:8-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 3s
-          --health-retries 5
-
-      kafka:
-        image: apache/kafka:4.3.1
-        ports:
-          - 9092:9092
-        env:
-          KAFKA_NODE_ID: 1
-          KAFKA_PROCESS_ROLES: broker,controller
-          CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
-          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
-          # The runner reaches the service container on localhost, so that is
-          # what the broker must advertise — the usual thing to get wrong.
-          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-        options: >-
-          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
-          --health-interval 10s
-          --health-timeout 10s
-          --health-retries 12
-          --health-start-period 30s
-
     steps:
       - uses: actions/checkout@v4
 
@@ -88,22 +40,48 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # The backing services come from docker-compose.yml rather than from
+      # GitHub's `services:` block. Two reasons, both practical:
+      #
+      #   - MongoDB has to start with --replSet, and a service container cannot
+      #     override the image command. Compose can.
+      #   - One definition instead of two. A service-container copy drifts from
+      #     compose the first time either changes, and the failure shows up as a
+      #     test that passes locally and fails here.
+      - name: Start MongoDB, Redis and Kafka
+        run: docker compose up -d --wait mongo-user mongo-seller mongo-product mongo-order mongo-marketplace mongo-live redis kafka
+
       - name: Full test suite
         env:
-          MONGO_URI: mongodb://localhost:27017
+          # One instance per service. directConnection because each replica set
+          # advertises "mongo-<service>:27017", which resolves inside the
+          # compose network and not on the runner.
+          MONGO_URI_USER: mongodb://127.0.0.1:27017/?directConnection=true
+          MONGO_URI_SELLER: mongodb://127.0.0.1:27018/?directConnection=true
+          MONGO_URI_PRODUCT: mongodb://127.0.0.1:27019/?directConnection=true
+          MONGO_URI_ORDER: mongodb://127.0.0.1:27020/?directConnection=true
+          MONGO_URI_MARKETPLACE: mongodb://127.0.0.1:27021/?directConnection=true
+          MONGO_URI_LIVE: mongodb://127.0.0.1:27022/?directConnection=true
           MONGO_DATABASE: ecommerce_test
-          REDIS_ADDR: localhost:6379
-          KAFKA_BROKERS: localhost:9092
+          # config's own tests clear the environment, so this only satisfies
+          # any code path that loads config directly.
+          MONGO_URI: mongodb://127.0.0.1:27017/?directConnection=true
+          REDIS_ADDR: 127.0.0.1:6379
+          KAFKA_BROKERS: 127.0.0.1:29092
           KAFKA_GROUP_ID: ci
           JWT_SECRET: ci-only-secret-of-at-least-32-characters
         run: go test -race -timeout 10m ./...
+
+      - name: Service logs on failure
+        if: failure()
+        run: docker compose logs --tail 100
 
   docker:
     name: Images build
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        service: [user, seller, product]
+        service: [user, seller, product, order, marketplace, live]
     steps:
       - uses: actions/checkout@v4
       - name: Build ${{ matrix.service }}

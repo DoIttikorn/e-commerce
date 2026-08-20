@@ -3,15 +3,10 @@ package integration
 import (
 	"context"
 	"errors"
-	"log/slog"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"github.com/DoIttikorn/e-commerce/internal/database"
 	"github.com/DoIttikorn/e-commerce/internal/product"
@@ -19,47 +14,13 @@ import (
 	"github.com/DoIttikorn/e-commerce/internal/product/rediscache"
 )
 
-func testMongo(t *testing.T) (*mongo.Database, context.Context) {
-	t.Helper()
-
-	if testing.Short() {
-		t.Skip("needs MongoDB; run make itest")
-	}
-
-	uri := envOr("MONGO_URI", "mongodb://127.0.0.1:27017")
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	t.Cleanup(cancel)
-
-	client, err := mongo.Connect(options.Client().ApplyURI(uri))
-	if err != nil {
-		t.Fatalf("connect mongo: %v", err)
-	}
-	if err := client.Ping(ctx, readpref.Primary()); err != nil {
-		t.Fatalf("mongo unreachable at %s: %v", uri, err)
-	}
-	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
-
-	return client.Database(envOr("MONGO_DATABASE", "ecommerce_test")), ctx
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func discard() *slog.Logger { return slog.New(slog.DiscardHandler) }
-
 // newCachedRepo returns the plain repository and the same repository behind the
 // Redis decorator, so a test can change the database behind the cache's back.
 func newCachedRepo(t *testing.T) (plain *productmongo.Repository, cached product.Repository, ctx context.Context) {
 	t.Helper()
 
-	db, ctx := testMongo(t)
-	if err := db.Collection(productmongo.CollectionName).Drop(ctx); err != nil {
-		t.Fatalf("drop products: %v", err)
-	}
+	db, ctx := mongoFor(t, "product")
+	dropAll(t, ctx, db, productmongo.CollectionName, productmongo.ReservationCollectionName)
 
 	plain = productmongo.NewRepository(db)
 	if err := plain.EnsureIndexes(ctx); err != nil {
@@ -80,8 +41,12 @@ func newCachedRepo(t *testing.T) (plain *productmongo.Repository, cached product
 	return plain, cached, ctx
 }
 
-func sampleProduct(name string) product.Product {
+// sampleProduct needs an ID because the repository no longer mints one on
+// insert: the service asks for it first, so the event written beside the row
+// can carry it.
+func sampleProduct(id, name string) product.Product {
 	return product.Product{
+		ID:       id,
 		SellerID: "seller-1", SellerName: "Original Shop", Name: name,
 		PriceMinor: 25000, Currency: "THB", Stock: 5,
 		CreatedAt: time.Now().UTC().Truncate(time.Millisecond),
@@ -94,7 +59,7 @@ func sampleProduct(name string) product.Product {
 func TestCacheServesTheSecondRead(t *testing.T) {
 	plain, cached, ctx := newCachedRepo(t)
 
-	created, err := cached.Create(ctx, sampleProduct("Blue Mug"))
+	created, err := cached.Create(ctx, sampleProduct(cached.NextID(), "Blue Mug"), nil)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
@@ -106,7 +71,7 @@ func TestCacheServesTheSecondRead(t *testing.T) {
 
 	// Change the database behind the cache's back.
 	newName := "Renamed In The Database"
-	if _, err := plain.Update(ctx, created.ID, product.Update{Name: &newName}); err != nil {
+	if _, err := plain.Update(ctx, created.ID, product.Update{Name: &newName}, nil); err != nil {
 		t.Fatalf("bypassing Update() error = %v", err)
 	}
 
@@ -125,7 +90,7 @@ func TestCacheServesTheSecondRead(t *testing.T) {
 func TestWritesInvalidateTheCache(t *testing.T) {
 	_, cached, ctx := newCachedRepo(t)
 
-	created, err := cached.Create(ctx, sampleProduct("Blue Mug"))
+	created, err := cached.Create(ctx, sampleProduct(cached.NextID(), "Blue Mug"), nil)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
@@ -134,7 +99,7 @@ func TestWritesInvalidateTheCache(t *testing.T) {
 	}
 
 	newName := "Green Mug"
-	if _, err := cached.Update(ctx, created.ID, product.Update{Name: &newName}); err != nil {
+	if _, err := cached.Update(ctx, created.ID, product.Update{Name: &newName}, nil); err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
 
@@ -155,7 +120,7 @@ func TestRenameSellerInvalidatesEveryAffectedProduct(t *testing.T) {
 
 	var ids []string
 	for _, name := range []string{"Mug", "Plate", "Bowl"} {
-		created, err := cached.Create(ctx, sampleProduct(name))
+		created, err := cached.Create(ctx, sampleProduct(cached.NextID(), name), nil)
 		if err != nil {
 			t.Fatalf("Create(%s) error = %v", name, err)
 		}
@@ -191,7 +156,7 @@ func TestRenameSellerInvalidatesEveryAffectedProduct(t *testing.T) {
 func TestRenameSellerIsANoOpWhenNothingChanges(t *testing.T) {
 	_, cached, ctx := newCachedRepo(t)
 
-	if _, err := cached.Create(ctx, sampleProduct("Mug")); err != nil {
+	if _, err := cached.Create(ctx, sampleProduct(cached.NextID(), "Mug"), nil); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
 
@@ -212,7 +177,7 @@ func TestRenameSellerIsANoOpWhenNothingChanges(t *testing.T) {
 func TestDeleteInvalidatesTheCache(t *testing.T) {
 	_, cached, ctx := newCachedRepo(t)
 
-	created, err := cached.Create(ctx, sampleProduct("Mug"))
+	created, err := cached.Create(ctx, sampleProduct(cached.NextID(), "Mug"), nil)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
@@ -220,7 +185,7 @@ func TestDeleteInvalidatesTheCache(t *testing.T) {
 		t.Fatalf("priming ByID() error = %v", err)
 	}
 
-	if err := cached.Delete(ctx, created.ID); err != nil {
+	if err := cached.Delete(ctx, created.ID, nil); err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
 

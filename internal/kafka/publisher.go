@@ -57,8 +57,16 @@ func (p *Publisher) Publish(ctx context.Context, topic, key string, payload any)
 	if err != nil {
 		return fmt.Errorf("marshal event: %w", err)
 	}
+	return p.PublishRaw(ctx, topic, key, body)
+}
 
-	err = p.writer.WriteMessages(ctx, kafka.Message{
+// PublishRaw writes an already-encoded payload.
+//
+// The outbox relay uses this: the payload was serialised inside the transaction
+// that produced it, and re-encoding it here would let a later change to the
+// event type quietly rewrite events recorded before that change.
+func (p *Publisher) PublishRaw(ctx context.Context, topic, key string, body []byte) error {
+	err := p.writer.WriteMessages(ctx, kafka.Message{
 		Topic: topic,
 		Key:   []byte(key),
 		Value: body,

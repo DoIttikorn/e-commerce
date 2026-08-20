@@ -2,11 +2,14 @@ package product
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
+
+	productv1 "github.com/DoIttikorn/e-commerce/api/product/v1"
 )
 
 const (
@@ -47,6 +50,14 @@ type Service interface {
 	// twice and eventually differently.
 	AuthorizeOwner(ctx context.Context, userID, productID string) error
 
+	// Reserve takes stock for an order, all lines or none. The key is the
+	// order ID, so a retried call takes stock once.
+	Reserve(ctx context.Context, key string, items []ReserveItem) ([]ReservedItem, error)
+
+	// Release is the compensating action for a reservation being undone. It is
+	// safe to call more than once.
+	Release(ctx context.Context, key string, items []ReserveItem) error
+
 	// ApplySellerEvent folds a Seller domain event into this domain's state.
 	// It is idempotent, because at-least-once delivery makes repeats certain.
 	ApplySellerEvent(ctx context.Context, ref SellerRef) error
@@ -76,6 +87,8 @@ type NewProduct struct {
 var _ Service = (*service)(nil)
 
 // NewService wires the domain to its adapters.
+// There is no publisher here. Events are handed to the repository with the
+// write and committed alongside it; publishing is the relay's job.
 func NewService(repo Repository, directory SellerDirectory, log *slog.Logger) Service {
 	return &service{repo: repo, directory: directory, log: log}
 }
@@ -124,7 +137,8 @@ func (s *service) Create(ctx context.Context, in NewProduct) (Product, error) {
 		return Product{}, err
 	}
 
-	return s.repo.Create(ctx, Product{
+	listing := Product{
+		ID:          s.repo.NextID(),
 		SellerID:    ref.SellerID,
 		SellerName:  ref.ShopName,
 		Name:        name,
@@ -133,7 +147,41 @@ func (s *service) Create(ctx context.Context, in NewProduct) (Product, error) {
 		Currency:    strings.ToUpper(in.Currency),
 		Stock:       in.Stock,
 		CreatedAt:   time.Now().UTC(),
+	}
+
+	event, err := s.event(productv1.EventProductListed, listing)
+	if err != nil {
+		return Product{}, err
+	}
+
+	return s.repo.Create(ctx, listing, []OutboxEvent{event})
+}
+
+// event builds an outbox entry describing a listing. Nothing is published here.
+func (s *service) event(eventType string, p Product) (OutboxEvent, error) {
+	payload, err := json.Marshal(productv1.ProductEvent{
+		Type:        eventType,
+		ProductID:   p.ID,
+		SellerID:    p.SellerID,
+		SellerName:  p.SellerName,
+		Name:        p.Name,
+		Description: p.Description,
+		PriceMinor:  p.PriceMinor,
+		Currency:    p.Currency,
+		Stock:       p.Stock,
+		OccurredAt:  time.Now().UTC(),
 	})
+	if err != nil {
+		return OutboxEvent{}, fmt.Errorf("marshal product event: %w", err)
+	}
+
+	// Keyed by product so a listing's own events stay in order.
+	return OutboxEvent{
+		Topic:     productv1.TopicProductEvents,
+		Key:       p.ID,
+		Payload:   payload,
+		CreatedAt: time.Now().UTC(),
+	}, nil
 }
 
 // ByID returns one product.
@@ -174,12 +222,72 @@ func (s *service) Update(ctx context.Context, id string, upd Update) (Product, e
 		return Product{}, err
 	}
 
-	return s.repo.Update(ctx, id, upd)
+	// The event describes the listing after the change, so it is built from
+	// what the update will produce rather than from what is there now.
+	current, err := s.repo.ByID(ctx, id)
+	if err != nil {
+		return Product{}, err
+	}
+
+	event, err := s.event(productv1.EventProductUpdated, applyUpdate(current, upd))
+	if err != nil {
+		return Product{}, err
+	}
+
+	return s.repo.Update(ctx, id, upd, []OutboxEvent{event})
+}
+
+// applyUpdate projects an update onto a product, so the event and the row the
+// transaction is about to write describe the same thing.
+func applyUpdate(p Product, upd Update) Product {
+	if upd.Name != nil {
+		p.Name = *upd.Name
+	}
+	if upd.Description != nil {
+		p.Description = *upd.Description
+	}
+	if upd.PriceMinor != nil {
+		p.PriceMinor = *upd.PriceMinor
+	}
+	if upd.Stock != nil {
+		p.Stock = *upd.Stock
+	}
+	return p
 }
 
 // Delete removes a product.
 func (s *service) Delete(ctx context.Context, id string) error {
-	return s.repo.Delete(ctx, id)
+	// Read first, so the delisting event can carry enough for a consumer to
+	// find its own copy without asking anybody.
+	found, err := s.repo.ByID(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	event, err := s.event(productv1.EventProductDelisted, found)
+	if err != nil {
+		return err
+	}
+
+	return s.repo.Delete(ctx, id, []OutboxEvent{event})
+}
+
+// Reserve takes stock for an order.
+//
+// The domain adds almost nothing to what the repository does, and that is the
+// point: the correctness lives in one conditional update inside one
+// transaction, where it can be reasoned about, rather than being spread across
+// a service that reads and then writes.
+func (s *service) Reserve(ctx context.Context, key string, items []ReserveItem) ([]ReservedItem, error) {
+	if len(items) == 0 {
+		return nil, &ValidationError{Fields: map[string]string{"items": "at least one item is required"}}
+	}
+	return s.repo.Reserve(ctx, key, items)
+}
+
+// Release returns reserved stock.
+func (s *service) Release(ctx context.Context, key string, items []ReserveItem) error {
+	return s.repo.Release(ctx, key, items)
 }
 
 // AuthorizeOwner reports whether the account owns the shop a product sits in.

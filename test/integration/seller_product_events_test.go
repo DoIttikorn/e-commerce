@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/DoIttikorn/e-commerce/internal/kafka"
+	"github.com/DoIttikorn/e-commerce/internal/outbox"
 	"github.com/DoIttikorn/e-commerce/internal/product"
 	productevents "github.com/DoIttikorn/e-commerce/internal/product/events"
 	productmongo "github.com/DoIttikorn/e-commerce/internal/product/mongodb"
@@ -53,22 +54,13 @@ func startPipeline(t *testing.T) (seller.Service, product.Service, *productmongo
 	t.Helper()
 
 	brokers := kafkaBrokers(t)
-	db, ctx := testMongo(t)
 
-	// Separate databases, as in the compose stack: neither service can reach
-	// the other's collections even by accident.
-	sellerDB := db.Client().Database(db.Name() + "_seller_evt")
-	productDB := db.Client().Database(db.Name() + "_product_evt")
-	for _, d := range []string{sellermongo.CollectionName} {
-		if err := sellerDB.Collection(d).Drop(ctx); err != nil {
-			t.Fatalf("drop %s: %v", d, err)
-		}
-	}
-	for _, d := range []string{productmongo.CollectionName, productmongo.DirectoryCollectionName} {
-		if err := productDB.Collection(d).Drop(ctx); err != nil {
-			t.Fatalf("drop %s: %v", d, err)
-		}
-	}
+	// Two separate MongoDB instances, as in the compose stack. Neither service
+	// could read the other's data even if somebody wrote the code to try.
+	sellerDB, ctx := mongoFor(t, "seller")
+	productDB, _ := mongoFor(t, "product")
+	dropAll(t, ctx, sellerDB, sellermongo.CollectionName, sellermongo.OutboxName)
+	dropAll(t, ctx, productDB, productmongo.CollectionName, productmongo.DirectoryCollectionName)
 
 	// The topic must exist before the consumer subscribes, or the first run
 	// against a fresh broker races auto-creation and times out.
@@ -81,9 +73,17 @@ func startPipeline(t *testing.T) (seller.Service, product.Service, *productmongo
 		t.Fatalf("seller indexes: %v", err)
 	}
 
+	sellerSvc := seller.NewService(sellerRepo, discard())
+
+	// The seller service records events; a relay publishes them. Running one
+	// here is what makes this test exercise the real path rather than a
+	// shortcut that publishes inline.
 	publisher := kafka.NewPublisher(brokers, discard())
 	t.Cleanup(func() { _ = publisher.Close() })
-	sellerSvc := seller.NewService(sellerRepo, publisher, discard())
+
+	relayCtx, stopRelay := context.WithCancel(ctx)
+	go outbox.NewRelay(sellerDB.Collection(sellermongo.OutboxName), publisher, discard()).Run(relayCtx)
+	t.Cleanup(stopRelay)
 
 	productRepo := productmongo.NewRepository(productDB)
 	if err := productRepo.EnsureIndexes(ctx); err != nil {

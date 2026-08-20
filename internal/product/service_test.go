@@ -8,15 +8,24 @@ import (
 )
 
 type fakeRepo struct {
-	createFn func(context.Context, Product) (Product, error)
-	byIDFn   func(context.Context, string) (Product, error)
-	renameFn func(context.Context, string, string) ([]string, error)
+	createFn  func(context.Context, Product) (Product, error)
+	byIDFn    func(context.Context, string) (Product, error)
+	renameFn  func(context.Context, string, string) ([]string, error)
+	reserveFn func(context.Context, string, []ReserveItem) ([]ReservedItem, error)
+	releaseFn func(context.Context, string, []ReserveItem) error
+
+	reserveKey   string
+	releasedKeys []string
+	events       []OutboxEvent
 
 	gotProduct Product
 	renames    int
 }
 
-func (f *fakeRepo) Create(ctx context.Context, p Product) (Product, error) {
+func (f *fakeRepo) NextID() string { return "product-1" }
+
+func (f *fakeRepo) Create(ctx context.Context, p Product, events []OutboxEvent) (Product, error) {
+	f.recordEvents(events)
 	f.gotProduct = p
 	if f.createFn != nil {
 		return f.createFn(ctx, p)
@@ -36,11 +45,43 @@ func (f *fakeRepo) List(context.Context, string, int, int) ([]Product, int, erro
 	return []Product{{ID: "product-1"}}, 1, nil
 }
 
-func (f *fakeRepo) Update(_ context.Context, id string, _ Update) (Product, error) {
+func (f *fakeRepo) Update(_ context.Context, id string, _ Update, events []OutboxEvent) (Product, error) {
+	f.recordEvents(events)
 	return Product{ID: id}, nil
 }
 
-func (f *fakeRepo) Delete(context.Context, string) error { return nil }
+func (f *fakeRepo) Delete(_ context.Context, _ string, events []OutboxEvent) error {
+	f.recordEvents(events)
+	return nil
+}
+
+// recordEvents captures what the service asked to be written alongside the row.
+func (f *fakeRepo) recordEvents(events []OutboxEvent) {
+	f.events = append(f.events, events...)
+}
+
+func (f *fakeRepo) Reserve(ctx context.Context, key string, items []ReserveItem) ([]ReservedItem, error) {
+	f.reserveKey = key
+	if f.reserveFn != nil {
+		return f.reserveFn(ctx, key, items)
+	}
+	out := make([]ReservedItem, 0, len(items))
+	for _, it := range items {
+		out = append(out, ReservedItem{
+			ProductID: it.ProductID, ProductName: "Fake", SellerID: "seller-1",
+			UnitMinor: 1000, Currency: "THB", Quantity: it.Quantity,
+		})
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) Release(ctx context.Context, key string, items []ReserveItem) error {
+	f.releasedKeys = append(f.releasedKeys, key)
+	if f.releaseFn != nil {
+		return f.releaseFn(ctx, key, items)
+	}
+	return nil
+}
 
 func (f *fakeRepo) RenameSeller(ctx context.Context, sellerID, shopName string) ([]string, error) {
 	f.renames++

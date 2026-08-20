@@ -1,11 +1,17 @@
 # e-commerce
 
-A Go backend built as three independently deployable services — **user**,
-**seller**, and **product** — sharing one repository. They serve REST and gRPC,
-store data in MongoDB, cache reads in Redis, and reach each other through Kafka
-events rather than by calling each other.
+A Go backend built as six independently deployable services — **user**,
+**seller**, **product**, **order**, **marketplace** and **live** — sharing one
+repository. They serve REST, gRPC and WebSocket; each owns its own MongoDB
+instance; and they reach each other through Kafka events rather than by calling
+each other, with exactly one deliberate exception.
 
+- **Start here — the one trace that exercises everything, and the decisions that
+  were not obvious:** [docs/highlights.md](docs/highlights.md)
 - **Architecture and reasoning:** [docs/domains.md](docs/domains.md)
+- **Why no service publishes from a request path:**
+  [docs/transactional-outbox.md](docs/transactional-outbox.md)
+  · [ภาษาไทย](docs/transactional-outbox.th.md)
 - **Technology choices, and what each costs:** [docs/tech-stack.md](docs/tech-stack.md)
 - **User domain design — stories, use cases, sequence diagrams:** [docs/user-domain-design.md](docs/user-domain-design.md)
 - **Measured performance:** [test/load/README.md](test/load/README.md)
@@ -35,17 +41,27 @@ curl -s localhost:8082/readyz    # {"status":"ready"}
 
 ## Services
 
-| Service | REST | gRPC | Admin | Database | Talks to |
+| Service | REST | gRPC | Admin | MongoDB | Notes |
 |---|---|---|---|---|---|
-| **user** | 8080 | 9090 | 6060 | `ecommerce_user` | — |
-| **seller** | 8081 | — | 6061 | `ecommerce_seller` | publishes to Kafka |
-| **product** | 8082 | — | 6062 | `ecommerce_product` | consumes from Kafka, caches in Redis |
+| **user** | 8080 | 9090 | 6060 | 27017 | issues every token |
+| **seller** | 8081 | — | 6061 | 27018 | publishes shop events |
+| **product** | 8082 | internal | 6062 | 27019 | catalogue, Redis cache, stock reservation |
+| **order** | 8083 | — | 6063 | 27020 | the saga; transactional outbox |
+| **marketplace** | 8084 | — | 6064 | 27021 | search projection from three streams |
+| **live** | 8085 | — | 6065 | 27022 | WebSocket; Redis presence and broadcast |
 
-Plus **Kafka UI on [localhost:8090](http://localhost:8090)** — a development tool
-for watching the event flow, described below.
+Plus **Kafka UI on [localhost:8090](http://localhost:8090)** — a development
+tool for watching the event flow, described below.
 
-Each owns a **separate database**. Sharing one and agreeing not to read each
-other's collections works right up until somebody does.
+Each owns a **separate MongoDB instance**, not a separate database on a shared
+server. Connection limits, cache, lock contention, backups, version upgrades and
+failures are all things a shared instance keeps shared regardless of how the
+databases are named.
+
+Every instance is a single-node replica set, because transactions and change
+streams both need an oplog. From the host, connect with `directConnection=true`:
+each set advertises its member as `mongo-<service>:27017`, a name that resolves
+inside the compose network and nowhere else.
 
 The admin port carries Prometheus metrics and pprof. It is never the API port —
 pprof can dump process memory and stall the process, so it belongs on an
@@ -188,7 +204,7 @@ Measured at **~400ms** locally. The seller service published, the product
 service consumed, updated every product that shop owns, and dropped exactly
 those entries from Redis. Neither service made a request to the other.
 
-To watch that happen rather than infer it, see [Watching the event flow](#watching-the-event-flow).
+To watch that happen rather than infer it, see [Watching the event flow](#10--watching-the-event-flow).
 
 ### 5 — The same user over gRPC
 
@@ -296,7 +312,166 @@ curl -s -X POST localhost:8080/api/v1/auth/login -H 'Content-Type: application/j
 # both: {"error":"invalid credentials"}
 ```
 
-### 7 — Watching the event flow
+### 7 — Place an order
+
+This is the one place a service calls another and waits. Order asks Product to
+reserve stock over gRPC, because a buyer cannot be told their order exists until
+the stock is secured.
+
+**`Idempotency-Key` is required.** It is not generated server-side: a key the
+server invents is a new key on every retry, which is the same as having none.
+Placing an order is the one operation here that spends money, so the caller has
+to decide what "the same order" means.
+
+```bash
+export PRODUCT_ID=$(curl -s "localhost:8082/api/v1/products?limit=1" | jq -r '.products[0].id')
+
+curl -s -X POST localhost:8083/api/v1/orders \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: order-$(date +%s)" \
+  -d "{\"items\":[{\"product_id\":\"$PRODUCT_ID\",\"quantity\":3}]}" | jq
+```
+
+```json
+{
+  "id": "6a8717246cfb8e2fcbbdf743",
+  "seller_id": "6a8716f4...",
+  "status": "pending",
+  "lines": [
+    {
+      "product_id": "6a87171401a76356ad521cc2",
+      "product_name": "Blue Ceramic Mug",
+      "unit_minor": 25000,
+      "quantity": 3,
+      "subtotal_minor": 75000
+    }
+  ],
+  "total_minor": 75000,
+  "currency": "THB"
+}
+```
+
+The price and name are **snapshots**, not references: a seller who reprices
+tomorrow must not change what somebody agreed to pay today.
+
+Stock came out of the Product service's own database, over gRPC:
+
+```bash
+curl -s "localhost:8082/api/v1/products/$PRODUCT_ID" | jq '{stock}'
+# {"stock": 7}   — it was 10
+```
+
+Retry with the same key and nothing is bought twice — the original order comes
+back with **200** instead of 201:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8083/api/v1/orders \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: the-same-key-as-before" \
+  -d "{\"items\":[{\"product_id\":\"$PRODUCT_ID\",\"quantity\":3}]}"
+```
+
+Cancelling puts the stock back. Paying keeps it:
+
+```bash
+export ORDER_ID=$(curl -s localhost:8083/api/v1/orders -H "Authorization: Bearer $TOKEN" | jq -r '.orders[0].id')
+
+curl -s -X POST "localhost:8083/api/v1/orders/$ORDER_ID/pay" \
+  -H "Authorization: Bearer $TOKEN" | jq '{id, status}'
+# {"id": "...", "status": "paid"}
+```
+
+Ordering more than exists returns **409**, not 400 — the request was correct and
+may well succeed later:
+
+```json
+{"error":"one or more items are out of stock"}
+```
+
+### 8 — Search the marketplace
+
+The Marketplace service has no write API. Everything in it arrived as an event
+from Product, Seller or Order, and it answers a question none of them can
+answer alone.
+
+```bash
+curl -s "localhost:8084/api/v1/marketplace/listings?q=ceramic&sort=best_selling" \
+  | jq '.listings[0]'
+```
+
+```json
+{
+  "product_id": "6a87171401a76356ad521cc2",
+  "seller_name": "Six Domains Pottery",
+  "name": "Blue Ceramic Mug",
+  "price_minor": 25000,
+  "in_stock": true,
+  "sold_count": 3
+}
+```
+
+Three separate streams produced that one row: the product and its price from
+`product.events`, the shop name from `seller.events`, and `sold_count` from the
+order you just paid.
+
+```bash
+# The text index actually discriminates — it is not a substring match.
+curl -s "localhost:8084/api/v1/marketplace/listings?q=ceramic" | jq .total   # 1
+curl -s "localhost:8084/api/v1/marketplace/listings?q=bicycle" | jq .total   # 0
+
+# Filter and sort.
+curl -s "localhost:8084/api/v1/marketplace/listings?min_price=10000&max_price=30000&sort=price_asc&in_stock=true" | jq '.total'
+```
+
+### 9 — Watch a live stream
+
+The host drives the stream over REST; viewers watch over a WebSocket. Watching
+is public — a browser cannot set headers on a WebSocket handshake, so an
+authenticated socket ends up with the token in the query string, which is the
+one place credentials are guaranteed to reach an access log.
+
+```bash
+export STREAM_ID=$(curl -s -X POST localhost:8085/api/v1/live/streams \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"Friday Pottery Sale"}' | jq -r .id)
+
+curl -s -X POST "localhost:8085/api/v1/live/streams/$STREAM_ID/start" \
+  -H "Authorization: Bearer $TOKEN" | jq '{status}'
+
+curl -s -X POST "localhost:8085/api/v1/live/streams/$STREAM_ID/feature" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"product_id\":\"$PRODUCT_ID\"}" | jq '{featured_product_id}'
+```
+
+Connect a viewer with any WebSocket client — `websocat` is convenient:
+
+```bash
+brew install websocat
+websocat "ws://localhost:8085/api/v1/live/streams/$STREAM_ID/watch"
+```
+
+The first message is a snapshot of what you are looking at:
+
+```json
+{"type":"stream.state","stream_id":"...","viewers":1,"featured_product_id":"...","status":"live","at":"..."}
+{"type":"viewer.joined","stream_id":"...","viewers":1,"at":"..."}
+```
+
+Now place and pay an order for the featured product in another terminal. The
+purchase arrives on the socket:
+
+```json
+{"type":"purchase","stream_id":"...","viewers":1,"featured_product_id":"...","product_name":"Blue Ceramic Mug","quantity":2,"at":"..."}
+```
+
+**Trace what just happened.** The order was paid on port 8083. That service
+wrote an event to its outbox in the same transaction, a relay published it to
+Kafka, the live service consumed it, asked its own database which streams are
+showing that product, and published to a Redis channel — which reached the
+instance holding your socket. The Order service has never heard of live streams,
+and nothing about it had to change for this to work.
+
+### 10 — Watching the event flow
 
 An event-driven system is hard to reason about precisely because the interesting
 part happens between the services rather than inside either one. `make docker-run`
@@ -342,7 +517,7 @@ Rename a shop with the stack open on that page and watch the offset advance.
 > The UI is a development tool with no authentication configured. It belongs on
 > a laptop or an internal network, never on a public one.
 
-### 8 — Look at what it is doing
+### 11 — Look at what it is doing
 
 ```bash
 # Cache hit rate on the product service
@@ -451,6 +626,37 @@ gRPC on `:9090` — `user.v1.UserService/CreateUser`, `.../GetUser`.
 | PATCH | `/api/v1/products/{id}` | bearer, owner only |
 | DELETE | `/api/v1/products/{id}` | bearer, owner only |
 
+### order — `:8083`
+
+| Method | Path | Auth |
+|---|---|---|
+| POST | `/api/v1/orders` | bearer + `Idempotency-Key` |
+| GET | `/api/v1/orders` | bearer, own only |
+| GET | `/api/v1/orders/{id}` | bearer, buyer only |
+| POST | `/api/v1/orders/{id}/cancel` | bearer, buyer only |
+| POST | `/api/v1/orders/{id}/pay` | bearer, buyer only |
+
+### marketplace — `:8084`
+
+| Method | Path | Auth |
+|---|---|---|
+| GET | `/api/v1/marketplace/listings` | **public** |
+
+Query: `q`, `seller_id`, `min_price`, `max_price`, `in_stock`, `sort`
+(`relevance`, `newest`, `price_asc`, `price_desc`, `best_selling`), `limit`, `offset`.
+
+### live — `:8085`
+
+| Method | Path | Auth |
+|---|---|---|
+| GET | `/api/v1/live/streams` | **public** |
+| GET | `/api/v1/live/streams/{id}` | **public** |
+| GET | `/api/v1/live/streams/{id}/watch` | **public**, WebSocket |
+| POST | `/api/v1/live/streams` | bearer |
+| POST | `/api/v1/live/streams/{id}/start` | bearer, host only |
+| POST | `/api/v1/live/streams/{id}/end` | bearer, host only |
+| POST | `/api/v1/live/streams/{id}/feature` | bearer, host only |
+
 ### Every service
 
 `GET /healthz` (liveness), `GET /readyz` (readiness), and on the admin port
@@ -518,6 +724,36 @@ dependencies.
 default for `JWT_SECRET` or `MONGO_URI`. A service that starts with a guessed
 security parameter is worse than one that refuses to start.
 
+**Placing an order is a saga, not a transaction.** Stock lives in another
+service with another database, so nothing could span both. Reserve, write,
+compensate on failure — and the remaining window, a crash between reserving and
+writing, is stated below rather than pretended away.
+
+**Reserving stock is an atomic conditional update, not a lock.**
+`{_id, stock: {$gte: n}}` with `$inc`: the server matches and decrements in one
+step, so twenty buyers racing for the last unit produce exactly one winner.
+There is a test that fires twenty concurrent orders at five units and asserts
+five orders and zero remaining stock.
+
+**No service publishes from a request path.** Every event is written into the
+same transaction as the change that produced it, and a relay publishes it
+afterwards. A service that writes and then publishes can succeed at one and fail
+at the other, losing the event with no way to detect it. Full reasoning in
+[docs/transactional-outbox.md](docs/transactional-outbox.md).
+
+**Marketplace has no write API.** A projection you can edit is no longer a
+projection of anything. Popularity is counted once per order ID, because
+at-least-once delivery would otherwise inflate every ranking on redelivery.
+
+**Live Commerce keeps nothing in process memory.** A WebSocket lives on one
+instance, so viewer counts and broadcasts both go through Redis — presence as a
+sorted set scored by time and pruned on read, broadcast as pub/sub. Redis is
+required there, unlike in Product and Marketplace where it is only a cache.
+
+**Redis pub/sub for live events, Kafka for everything else.** Pub/sub has no
+replay, which is correct for a feed whose value decays in seconds and would be a
+disaster for an order.
+
 ### Known limitations
 
 Stated because they are real, not because they are hypothetical:
@@ -527,8 +763,10 @@ Stated because they are real, not because they are hypothetical:
   The fix is a transactional outbox, and it is the first thing to add.
 - **No distributed tracing.** Request IDs correlate logs within a service; across
   services, OpenTelemetry is the answer and is not here yet.
-- **MongoDB runs as a standalone node,** so multi-document transactions are not
-  available. This does not affect the three services built, and it blocks Order.
+- **No reaper for stranded reservations.** A crash between reserving stock and
+  writing the order holds stock against nothing until somebody notices.
+- **Single-node replica sets and one Kafka partition per topic.** The first buys
+  no redundancy; the second caps consumer parallelism at one instance per group.
 - **All services share one JWT secret.** See the JWT section.
 - **Kafka topics are created with one partition,** which caps consumer parallelism
   at one instance per group.
@@ -541,7 +779,7 @@ make itest    # everything, needs the stack up
 make lint     # gofmt + vet, exactly what CI runs
 ```
 
-189 tests. Unit tests use hand-written fakes and no mocking framework —
+266 tests. Unit tests use hand-written fakes and no mocking framework —
 `service_test.go` runs the whole business-logic suite with no database and no
 HTTP, which is what the port interfaces are for.
 
@@ -593,9 +831,8 @@ docs/           architecture, technology decisions, domain design
 `http.HandlerFunc` and read parameters with `r.PathValue`, so swapping to echo
 means writing one adapter, not touching handlers.
 
-## Not built
+## What is not here
 
-Order, Marketplace, and Live Commerce. Order is the interesting one — inventory
-reservation under concurrency — and it is blocked on moving MongoDB to a replica
-set first. [docs/domains.md](docs/domains.md) has the dependency order and the
-reasoning.
+`docs/lottery-search-design.md`, and the gaps listed above.
+[docs/domains.md](docs/domains.md) has the full map and the reasoning behind
+each boundary.

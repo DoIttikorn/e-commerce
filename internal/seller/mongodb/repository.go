@@ -12,6 +12,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/DoIttikorn/e-commerce/internal/outbox"
 	"github.com/DoIttikorn/e-commerce/internal/seller"
 )
 
@@ -54,15 +55,28 @@ func shopNameKey(name string) string { return strings.ToLower(strings.TrimSpace(
 
 // Repository implements seller.Repository.
 type Repository struct {
-	coll *mongo.Collection
+	db     *mongo.Database
+	coll   *mongo.Collection
+	outbox *mongo.Collection
 }
 
 var _ seller.Repository = (*Repository)(nil)
 
+// OutboxName is where this domain's pending events live.
+const OutboxName = outbox.CollectionName
+
 // NewRepository returns a Repository over db's sellers collection.
 func NewRepository(db *mongo.Database) *Repository {
-	return &Repository{coll: db.Collection(CollectionName)}
+	return &Repository{
+		db:     db,
+		coll:   db.Collection(CollectionName),
+		outbox: db.Collection(OutboxName),
+	}
 }
+
+// NextID mints an ObjectID up front, so the event written beside the shop can
+// carry the shop's ID rather than being patched after the fact.
+func (r *Repository) NextID() string { return bson.NewObjectID().Hex() }
 
 // EnsureIndexes creates the two constraints the domain depends on: one shop per
 // account, and shop names unique regardless of case. Both are enforced by the
@@ -81,7 +95,7 @@ func (r *Repository) EnsureIndexes(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create seller indexes: %w", err)
 	}
-	return nil
+	return outbox.EnsureIndexes(ctx, r.outbox)
 }
 
 // duplicateError works out which unique index rejected a write.
@@ -104,8 +118,15 @@ func duplicateError(err error) error {
 	}
 }
 
-func (r *Repository) Create(ctx context.Context, s seller.Seller) (seller.Seller, error) {
+// Create writes the shop and its events in one transaction.
+func (r *Repository) Create(ctx context.Context, s seller.Seller, events []seller.OutboxEvent) (seller.Seller, error) {
+	oid, err := bson.ObjectIDFromHex(s.ID)
+	if err != nil {
+		return seller.Seller{}, seller.ErrInvalidID
+	}
+
 	doc := document{
+		ID:          oid,
 		UserID:      s.UserID,
 		ShopName:    s.ShopName,
 		ShopNameKey: shopNameKey(s.ShopName),
@@ -113,7 +134,15 @@ func (r *Repository) Create(ctx context.Context, s seller.Seller) (seller.Seller
 		CreatedAt:   s.CreatedAt,
 	}
 
-	res, err := r.coll.InsertOne(ctx, doc)
+	out, err := r.inTransaction(ctx, func(sc context.Context) (any, error) {
+		if _, err := r.coll.InsertOne(sc, doc); err != nil {
+			return nil, err
+		}
+		if err := outbox.Append(sc, r.outbox, toOutboxEvents(events)); err != nil {
+			return nil, err
+		}
+		return doc.toDomain(), nil
+	})
 	if err != nil {
 		if dup := duplicateError(err); dup != nil {
 			return seller.Seller{}, dup
@@ -121,12 +150,29 @@ func (r *Repository) Create(ctx context.Context, s seller.Seller) (seller.Seller
 		return seller.Seller{}, fmt.Errorf("insert seller: %w", err)
 	}
 
-	id, ok := res.InsertedID.(bson.ObjectID)
-	if !ok {
-		return seller.Seller{}, fmt.Errorf("insert seller: unexpected id type %T", res.InsertedID)
+	created, _ := out.(seller.Seller)
+	return created, nil
+}
+
+// inTransaction runs fn inside a session transaction.
+func (r *Repository) inTransaction(ctx context.Context, fn func(context.Context) (any, error)) (any, error) {
+	session, err := r.db.Client().StartSession()
+	if err != nil {
+		return nil, fmt.Errorf("start session: %w", err)
 	}
-	doc.ID = id
-	return doc.toDomain(), nil
+	defer session.EndSession(ctx)
+
+	return session.WithTransaction(ctx, fn)
+}
+
+func toOutboxEvents(events []seller.OutboxEvent) []outbox.Event {
+	out := make([]outbox.Event, 0, len(events))
+	for _, e := range events {
+		out = append(out, outbox.Event{
+			Topic: e.Topic, Key: e.Key, Payload: e.Payload, CreatedAt: e.CreatedAt,
+		})
+	}
+	return out
 }
 
 func (r *Repository) ByID(ctx context.Context, id string) (seller.Seller, error) {
@@ -180,7 +226,8 @@ func (r *Repository) List(ctx context.Context, limit, offset int) ([]seller.Sell
 	return sellers, int(total), nil
 }
 
-func (r *Repository) Update(ctx context.Context, id string, upd seller.Update) (seller.Seller, error) {
+// Update writes the change and its events in one transaction.
+func (r *Repository) Update(ctx context.Context, id string, upd seller.Update, events []seller.OutboxEvent) (seller.Seller, error) {
 	oid, err := bson.ObjectIDFromHex(id)
 	if err != nil {
 		return seller.Seller{}, seller.ErrInvalidID
@@ -198,12 +245,20 @@ func (r *Repository) Update(ctx context.Context, id string, upd seller.Update) (
 		return r.ByID(ctx, id)
 	}
 
-	var doc document
-	err = r.coll.FindOneAndUpdate(ctx,
-		bson.M{"_id": oid},
-		bson.M{"$set": set},
-		options.FindOneAndUpdate().SetReturnDocument(options.After),
-	).Decode(&doc)
+	out, err := r.inTransaction(ctx, func(sc context.Context) (any, error) {
+		var doc document
+		if err := r.coll.FindOneAndUpdate(sc,
+			bson.M{"_id": oid},
+			bson.M{"$set": set},
+			options.FindOneAndUpdate().SetReturnDocument(options.After),
+		).Decode(&doc); err != nil {
+			return nil, err
+		}
+		if err := outbox.Append(sc, r.outbox, toOutboxEvents(events)); err != nil {
+			return nil, err
+		}
+		return doc.toDomain(), nil
+	})
 
 	switch {
 	case duplicateError(err) != nil:
@@ -213,5 +268,7 @@ func (r *Repository) Update(ctx context.Context, id string, upd seller.Update) (
 	case err != nil:
 		return seller.Seller{}, fmt.Errorf("update seller: %w", err)
 	}
-	return doc.toDomain(), nil
+
+	updated, _ := out.(seller.Seller)
+	return updated, nil
 }

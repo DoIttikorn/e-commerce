@@ -2,6 +2,7 @@ package seller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -21,15 +22,6 @@ const (
 	DefaultPageSize = 20
 	MaxPageSize     = 100
 )
-
-// EventPublisher announces a change to whoever is listening.
-//
-// Declared here as a port, so the domain neither imports the Kafka client nor
-// knows how many consumers there are — which is the entire reason a change here
-// does not become a list of outbound calls that grows with every new domain.
-type EventPublisher interface {
-	Publish(ctx context.Context, topic, key string, payload any) error
-}
 
 // Service is everything the Seller domain can do.
 //
@@ -59,9 +51,8 @@ type Service interface {
 
 // service is the implementation.
 type service struct {
-	repo   Repository
-	events EventPublisher
-	log    *slog.Logger
+	repo Repository
+	log  *slog.Logger
 }
 
 // NewSeller is the input to Register.
@@ -73,8 +64,13 @@ type NewSeller struct {
 var _ Service = (*service)(nil)
 
 // NewService wires the domain to its adapters.
-func NewService(repo Repository, events EventPublisher, log *slog.Logger) Service {
-	return &service{repo: repo, events: events, log: log}
+//
+// There is no publisher here any more. Events are handed to the repository with
+// the write and committed alongside it; publishing is the relay's job, and this
+// package no longer has a way to lose an event by succeeding at one and failing
+// at the other.
+func NewService(repo Repository, log *slog.Logger) Service {
+	return &service{repo: repo, log: log}
 }
 
 // Register opens a shop for a user.
@@ -92,18 +88,20 @@ func (s *service) Register(ctx context.Context, in NewSeller) (Seller, error) {
 		return Seller{}, err
 	}
 
-	created, err := s.repo.Create(ctx, Seller{
+	shop := Seller{
+		ID:        s.repo.NextID(),
 		UserID:    in.UserID,
 		ShopName:  name,
 		Status:    StatusActive,
 		CreatedAt: time.Now().UTC(),
-	})
+	}
+
+	event, err := s.event(sellerv1.EventSellerRegistered, shop)
 	if err != nil {
 		return Seller{}, err
 	}
 
-	s.announce(ctx, sellerv1.EventSellerRegistered, created)
-	return created, nil
+	return s.repo.Create(ctx, shop, []OutboxEvent{event})
 }
 
 // ByID returns one shop.
@@ -150,40 +148,58 @@ func (s *service) Update(ctx context.Context, id string, upd Update) (Seller, er
 		return Seller{}, err
 	}
 
-	updated, err := s.repo.Update(ctx, id, upd)
+	// The event describes the shop after the change, so it is built from what
+	// the update will produce rather than from what is there now.
+	current, err := s.repo.ByID(ctx, id)
 	if err != nil {
 		return Seller{}, err
 	}
 
-	s.announce(ctx, sellerv1.EventSellerUpdated, updated)
-	return updated, nil
+	event, err := s.event(sellerv1.EventSellerUpdated, apply(current, upd))
+	if err != nil {
+		return Seller{}, err
+	}
+
+	return s.repo.Update(ctx, id, upd, []OutboxEvent{event})
 }
 
-// announce publishes an event about a shop.
+// apply projects an update onto a shop, so the event and the row that the
+// transaction is about to write describe the same thing.
+func apply(s Seller, upd Update) Seller {
+	if upd.ShopName != nil {
+		s.ShopName = *upd.ShopName
+	}
+	if upd.Status != nil {
+		s.Status = *upd.Status
+	}
+	return s
+}
+
+// event builds an outbox entry describing a shop.
 //
-// A failure is logged and swallowed, which is a real limitation and worth
-// naming: the write has already committed, so returning an error here would
-// report a failure for something that succeeded, while the event is lost
-// either way. The correct fix is a transactional outbox — write the event to
-// the same database in the same transaction and have a relay publish it — and
-// that is the first thing to add when this stops being a demonstration.
-func (s *service) announce(ctx context.Context, eventType string, seller Seller) {
-	event := sellerv1.SellerEvent{
+// Nothing is published here. The entry is handed to the repository and written
+// in the same transaction as the change it describes, so the two cannot
+// disagree: either both happened or neither did.
+func (s *service) event(eventType string, shop Seller) (OutboxEvent, error) {
+	payload, err := json.Marshal(sellerv1.SellerEvent{
 		Type:       eventType,
-		SellerID:   seller.ID,
-		UserID:     seller.UserID,
-		ShopName:   seller.ShopName,
-		Status:     string(seller.Status),
+		SellerID:   shop.ID,
+		UserID:     shop.UserID,
+		ShopName:   shop.ShopName,
+		Status:     string(shop.Status),
 		OccurredAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return OutboxEvent{}, fmt.Errorf("marshal seller event: %w", err)
 	}
 
 	// Keyed by seller ID so every event about one shop keeps its order.
-	if err := s.events.Publish(ctx, sellerv1.TopicSellerEvents, seller.ID, event); err != nil {
-		s.log.LogAttrs(ctx, slog.LevelError, "publishing seller event failed",
-			slog.String("type", eventType),
-			slog.String("seller_id", seller.ID),
-			slog.String("error", err.Error()))
-	}
+	return OutboxEvent{
+		Topic:     sellerv1.TopicSellerEvents,
+		Key:       shop.ID,
+		Payload:   payload,
+		CreatedAt: time.Now().UTC(),
+	}, nil
 }
 
 func checkShopName(name string) string {

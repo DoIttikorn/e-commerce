@@ -61,7 +61,7 @@ proto:
 	@echo "Generating protobuf..."
 	@protoc --go_out=. --go_opt=paths=source_relative \
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
-		api/user/v1/*.proto
+		api/user/v1/*.proto api/product/v1/*.proto
 
 ## docker-run: build and start everything — three services, MongoDB, Redis, Kafka
 ##             --remove-orphans clears containers left by an earlier compose file

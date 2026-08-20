@@ -83,7 +83,7 @@ Two conclusions that only fall out of having measured:
 # Start a second product service with no Redis, sharing the same MongoDB.
 JWT_SECRET=$(grep '^JWT_SECRET=' .env | cut -d= -f2-) \
 HTTP_ADDR=:8083 ADMIN_ADDR=:6063 GRPC_ADDR=:9099 \
-MONGO_URI=mongodb://127.0.0.1:27017 MONGO_DATABASE=ecommerce_product \
+MONGO_URI=mongodb://127.0.0.1:27017/?directConnection=true MONGO_DATABASE=ecommerce_product \
 KAFKA_BROKERS=127.0.0.1:29092 KAFKA_GROUP_ID=nocache-experiment \
 go run ./cmd/product
 

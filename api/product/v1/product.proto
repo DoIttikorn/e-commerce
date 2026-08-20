@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package product.v1;
+
+option go_package = "github.com/DoIttikorn/e-commerce/api/product/v1;productv1";
+
+// StockService is the internal surface the Order domain calls.
+//
+// This is the one place in the system where a synchronous call is right and an
+// event is wrong. An order cannot be confirmed without knowing the stock was
+// secured, and "I will find out shortly" is not an answer a buyer can act on.
+// Everything else between services is an event precisely because it can wait.
+service StockService {
+  // Reserve decrements stock for several items at once.
+  //
+  // It is all-or-nothing from the caller's point of view: on failure, anything
+  // already taken is put back before the error is returned, so a partial
+  // reservation never survives the call.
+  rpc Reserve(ReserveRequest) returns (ReserveResponse);
+
+  // Release returns previously reserved stock. It is the compensating action
+  // for a saga step that has to be undone — a cancelled order, or a payment
+  // that never arrived.
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+}
+
+message StockItem {
+  string product_id = 1;
+  int32 quantity = 2;
+}
+
+message ReserveRequest {
+  repeated StockItem items = 1;
+
+  // idempotency_key is the order ID. Reserving twice with the same key must
+  // take stock once: a network timeout tells the caller nothing about whether
+  // the server acted, so the caller will retry, and without this the retry
+  // would double-count.
+  string idempotency_key = 1000;
+}
+
+// ReservedItem echoes back what was taken, including the price and name at the
+// moment of reservation. The order snapshots these: a product repriced tomorrow
+// must not change what somebody agreed to pay today.
+message ReservedItem {
+  string product_id = 1;
+  string product_name = 2;
+  int64 unit_price_minor = 3;
+  string currency = 4;
+  int32 quantity = 5;
+  string seller_id = 6;
+}
+
+message ReserveResponse {
+  repeated ReservedItem items = 1;
+}
+
+message ReleaseRequest {
+  repeated StockItem items = 1;
+  string idempotency_key = 1000;
+}
+
+message ReleaseResponse {
+  int32 released_items = 1;
+}

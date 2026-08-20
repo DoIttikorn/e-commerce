@@ -14,6 +14,7 @@ import (
 	"github.com/DoIttikorn/e-commerce/internal/appserver"
 	"github.com/DoIttikorn/e-commerce/internal/auth"
 	"github.com/DoIttikorn/e-commerce/internal/kafka"
+	"github.com/DoIttikorn/e-commerce/internal/outbox"
 	"github.com/DoIttikorn/e-commerce/internal/seller"
 	sellerhandler "github.com/DoIttikorn/e-commerce/internal/seller/handler"
 	sellermongo "github.com/DoIttikorn/e-commerce/internal/seller/mongodb"
@@ -57,7 +58,18 @@ func run() error {
 		return err
 	}
 
-	svc := seller.NewService(repo, publisher, app.Log)
+	svc := seller.NewService(repo, app.Log)
+
+	// The service records events; the relay publishes them. Nothing in the
+	// request path talks to Kafka, so a broker outage slows nothing and loses
+	// nothing — the events simply queue in MongoDB until it returns.
+	outboxColl := app.Mongo.Collection(sellermongo.OutboxName)
+	app.Go(outbox.NewRelay(outboxColl, publisher, app.Log).Run)
+
+	app.ReadyCheck("outbox", func(ctx context.Context) error {
+		_, err := outbox.PendingCount(ctx, outboxColl)
+		return err
+	})
 	tokens := auth.NewTokens(app.Cfg.JWTSecret, app.Cfg.JWTTTL)
 	sellerhandler.New(svc, app.Log).Register(app.Router, auth.Middleware(tokens))
 

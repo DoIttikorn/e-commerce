@@ -9,34 +9,51 @@ seven planned domains are built.
 flowchart LR
     client([Client])
 
-    subgraph user_svc["user service :8080 / :9090"]
-        user_domain[internal/user]
+    subgraph row1[" "]
+        user["user :8080 / :9090"]
+        seller["seller :8081"]
+        product["product :8082 / gRPC"]
     end
-    subgraph seller_svc["seller service :8081"]
-        seller_domain[internal/seller]
-    end
-    subgraph product_svc["product service :8082"]
-        product_domain[internal/product]
+    subgraph row2[" "]
+        order["order :8083"]
+        marketplace["marketplace :8084"]
+        live["live :8085 / websocket"]
     end
 
-    mongo_u[(ecommerce_user)]
-    mongo_s[(ecommerce_seller)]
-    mongo_p[(ecommerce_product)]
+    kafka{{"Kafka"}}
     redis[(Redis)]
-    kafka{{"Kafka: seller.events"}}
 
-    client -->|REST| user_svc
-    client -->|REST| seller_svc
-    client -->|REST| product_svc
+    client --> user
+    client --> seller
+    client --> product
+    client --> order
+    client --> marketplace
+    client -. websocket .-> live
 
-    user_svc --- mongo_u
-    seller_svc --- mongo_s
-    product_svc --- mongo_p
-    product_svc --- redis
+    seller -->|seller.events| kafka
+    product -->|product.events| kafka
+    order -->|order.events<br/>via outbox| kafka
 
-    seller_svc -->|publish| kafka
-    kafka -->|consume| product_svc
+    kafka --> product
+    kafka --> marketplace
+    kafka --> live
+
+    order ==>|gRPC: reserve stock| product
+
+    product --- redis
+    marketplace --- redis
+    live --- redis
 ```
+
+**The thick arrow is the only synchronous call in the system.** Order asks
+Product to reserve stock and waits, because a buyer cannot be told their order
+exists until the stock is secured. Everything else is an event, because
+everything else can wait.
+
+Each service owns a **separate MongoDB instance** — not a separate database on
+a shared server. Connection limits, cache, lock contention, backups, version
+upgrades and failures are all things a shared instance keeps shared regardless
+of how the databases are named.
 
 The arrows that are **not** there matter as much as the ones that are. No
 service calls another to serve a request, and no service reaches another's
@@ -86,6 +103,89 @@ The things sellers list. The **consumer**, and the only service with a cache.
 | Driven adapters | `mongodb/`, `rediscache/`, `events/` |
 | Ports it declares | `Repository`, `SellerDirectory` |
 | Consumes | `seller.events`, in group `product-service` |
+
+### Order — `internal/order`, `cmd/order`
+
+What a buyer has committed to buy. The only service that calls another.
+
+| | |
+|---|---|
+| Storage | `mongo-order`; unique index on the idempotency key |
+| Driving adapters | `handler/` (REST) |
+| Driven adapters | `mongodb/` with a **transactional outbox**, `grpcstock/` |
+| Publishes | `order.placed`, `order.paid`, `order.cancelled` |
+
+Placing an order is a **saga**, not a transaction — stock lives in another
+service with another database, so no transaction could span both:
+
+1. Reserve stock over gRPC. All lines or none, idempotent under the caller's key.
+2. Write the order and its event in one local transaction.
+3. If step 2 fails, release the reservation.
+
+The window that remains is a crash between 1 and 2, leaving stock held against
+no order. A reaper that releases reservations with no matching order is the
+first thing this needs before it carries real money, and it is not built.
+
+**Every publisher uses the outbox** — order, seller and product all write their
+events into the same transaction as the change, and a relay publishes them
+afterwards. `live` is the deliberate exception: it publishes to Redis pub/sub,
+where a guarantee would be machinery in service of an event that is worthless
+once stale. Reasoning in [transactional-outbox.md](transactional-outbox.md).
+
+### Marketplace — `internal/marketplace`, `cmd/marketplace`
+
+One searchable view of what every shop is selling. Owns no truth and has **no
+write API** — every row arrived as an event.
+
+| | |
+|---|---|
+| Storage | `mongo-marketplace`; a MongoDB text index, weighted toward the name |
+| Driving adapters | `handler/` (REST, public) |
+| Driven adapters | `mongodb/`, `rediscache/`, `events/` |
+| Consumes | `product.events`, `seller.events`, `order.events` — three separate consumer groups |
+
+It answers questions none of its sources can answer alone: *best-selling mugs
+under 300 baht from shops that are still trading* spans all three streams.
+Popularity is accumulated from paid orders — counted once per order ID, because
+at-least-once delivery would otherwise inflate every ranking on redelivery.
+
+Three groups rather than one, so a backlog on orders cannot stop new products
+from appearing in search.
+
+### Live Commerce — `internal/live`, `cmd/live`
+
+A seller broadcasting, viewers watching, products selling while it happens.
+
+| | |
+|---|---|
+| Storage | `mongo-live` |
+| Driving adapters | `handler/` — REST for the host, **WebSocket** for viewers |
+| Driven adapters | `mongodb/`, `redisbus/`, `events/` |
+| Consumes | `seller.events`, `order.events` |
+
+This is the only domain whose difficulty is not in its data. A WebSocket lives
+on **exactly one instance**, which makes two things impossible to do in process
+memory:
+
+- **Viewer count.** A map per instance gives every viewer a number that is wrong
+  by however many people are connected elsewhere.
+- **Broadcast.** A purchase handled by instance B has to reach a socket held by
+  instance A.
+
+Redis carries both: a sorted set every instance can count, and a pub/sub channel
+every instance can listen on. Presence is scored by timestamp and pruned on
+read, because nobody sends a goodbye when a laptop lid closes and an instance
+that crashes sends none for anyone it was holding.
+
+Pub/sub is deliberately not Kafka. It has no replay: a subscriber that was not
+listening never sees the message. For a live feed that is correct — a purchase
+notification from thirty seconds ago is not worth showing — and for an order it
+would be a disaster, which is why the two use different transports.
+
+Watching is public, and that is a security decision as much as a product one: a
+browser cannot set headers on a WebSocket handshake, so an authenticated socket
+ends up with the token in the query string, which is the one place credentials
+are guaranteed to reach somebody's access log.
 
 ## Where Kafka earns its place
 
@@ -174,17 +274,21 @@ The service is written as if no cache exists. Consequences worth naming:
 `product_cache_lookups_total{result="hit|miss|error"}` is on the admin port. A
 cache whose hit rate nobody can see is a guess.
 
-## Not built
+## Known gaps
 
-| Domain | Depends on | Note |
-|---|---|---|
-| Order | User, Product, Seller | **Blocked**: decrementing stock and writing an order atomically needs a MongoDB replica set, and compose runs a standalone node |
-| Marketplace | Product, Seller | Read side: search and browse across shops |
-| Live Commerce | all of the above | Needs realtime on top of the order flow |
+Stated because they are real, in rough priority order:
 
-Order is the one with the most engineering in it — inventory reservation under
-concurrency is the same problem as the lottery allocation design in
-`lottery-search-design.md`, and the same primitives solve it.
+1. **No reaper for stranded reservations.** A crash between reserving stock and
+   writing the order holds stock against nothing until somebody notices.
+2. **No distributed tracing.** Request IDs correlate within a service; across
+   six of them, OpenTelemetry is the answer and is not here.
+3. **One JWT secret shared by every service.** The issuer should hold a private
+   key and the others only the public one.
+4. **The Product gRPC port has no service authentication.** It is unpublished
+   and in-network only; mutual TLS is the production answer.
+5. **Single-node replica sets and one Kafka partition per topic.** Both are
+   development conveniences: the first buys no redundancy, the second caps
+   consumer parallelism at one instance per group.
 
 ## Adding the next one
 

@@ -8,14 +8,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"testing"
 	"time"
-
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"github.com/DoIttikorn/e-commerce/internal/user"
 	usermongo "github.com/DoIttikorn/e-commerce/internal/user/mongodb"
@@ -24,38 +19,10 @@ import (
 func newTestRepo(t *testing.T) (*usermongo.Repository, context.Context) {
 	t.Helper()
 
-	if testing.Short() {
-		t.Skip("needs MongoDB; run make itest")
-	}
-
-	uri := os.Getenv("MONGO_URI")
-	if uri == "" {
-		uri = "mongodb://127.0.0.1:27017"
-	}
-	dbName := os.Getenv("MONGO_DATABASE")
-	if dbName == "" {
-		dbName = "ecommerce_test"
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	t.Cleanup(cancel)
-
-	client, err := mongo.Connect(options.Client().ApplyURI(uri))
-	if err != nil {
-		t.Fatalf("connect mongo: %v", err)
-	}
-	if err := client.Ping(ctx, readpref.Primary()); err != nil {
-		t.Fatalf("mongo unreachable at %s: %v", uri, err)
-	}
-	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
-
-	db := client.Database(dbName)
-
-	// Drop rather than delete, so each test also re-creates the indexes and
+	db, ctx := mongoFor(t, "user")
+	// Dropped rather than emptied, so each test also re-creates the indexes and
 	// therefore exercises EnsureIndexes rather than trusting it ran once.
-	if err := db.Collection(usermongo.CollectionName).Drop(ctx); err != nil {
-		t.Fatalf("drop collection: %v", err)
-	}
+	dropAll(t, ctx, db, usermongo.CollectionName)
 
 	repo := usermongo.NewRepository(db)
 	if err := repo.EnsureIndexes(ctx); err != nil {
