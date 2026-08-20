@@ -250,6 +250,11 @@ Rules that come from things that have already bitten:
 - **Create topics at startup** with `kafka.EnsureTopic` rather than relying on
   auto-creation. A consumer that subscribes before the first publish otherwise
   races topic creation and sits idle.
+- **Tests reuse one stable consumer group**, never a unique one per run. A fresh
+  group each time abandons the old one in the broker, and they accumulate.
+- **Consumer lag is the metric that matters.** `make kafka-ui` shows it per
+  group; a lag that climbs means the consumer is losing to the producer, and
+  every health check will still be green.
 - **Publishing happens after the write and cannot fail it.** The write is already
   committed, so a publish error is logged, not returned. This loses the event —
   the fix is a transactional outbox, and it is the first thing to add when this
@@ -466,7 +471,8 @@ make load-smoke             # k6 sanity check, 1 user
 make load-read              # k6 load on the cached catalogue read
 make load-auth              # k6 load on login
 
-make docker-run             # build and start all six containers
+make docker-run             # build and start the whole stack
+make kafka-ui               # open the Kafka topic browser on :8090
 make docker-logs SERVICE=product
 make docker-down            # stop, keeping data volumes
 make docker-clean           # stop and delete the volumes too

@@ -1,0 +1,601 @@
+# e-commerce
+
+A Go backend built as three independently deployable services — **user**,
+**seller**, and **product** — sharing one repository. They serve REST and gRPC,
+store data in MongoDB, cache reads in Redis, and reach each other through Kafka
+events rather than by calling each other.
+
+- **Architecture and reasoning:** [docs/domains.md](docs/domains.md)
+- **Technology choices, and what each costs:** [docs/tech-stack.md](docs/tech-stack.md)
+- **User domain design — stories, use cases, sequence diagrams:** [docs/user-domain-design.md](docs/user-domain-design.md)
+- **Measured performance:** [test/load/README.md](test/load/README.md)
+
+## Quick start
+
+Requires Docker and Go 1.26.
+
+```bash
+cp .env.example .env
+# Set JWT_SECRET to at least 32 characters. The service refuses to start
+# without one rather than falling back to a default nobody changes.
+echo "JWT_SECRET=$(openssl rand -base64 48)" >> .env
+
+make docker-run
+```
+
+That builds three images and starts six containers. When it settles:
+
+```bash
+curl -s localhost:8080/healthz   # {"status":"ok"}
+curl -s localhost:8081/readyz    # {"status":"ready"}
+curl -s localhost:8082/readyz    # {"status":"ready"}
+```
+
+`make` on its own lists every target.
+
+## Services
+
+| Service | REST | gRPC | Admin | Database | Talks to |
+|---|---|---|---|---|---|
+| **user** | 8080 | 9090 | 6060 | `ecommerce_user` | — |
+| **seller** | 8081 | — | 6061 | `ecommerce_seller` | publishes to Kafka |
+| **product** | 8082 | — | 6062 | `ecommerce_product` | consumes from Kafka, caches in Redis |
+
+Plus **Kafka UI on [localhost:8090](http://localhost:8090)** — a development tool
+for watching the event flow, described below.
+
+Each owns a **separate database**. Sharing one and agreeing not to read each
+other's collections works right up until somebody does.
+
+The admin port carries Prometheus metrics and pprof. It is never the API port —
+pprof can dump process memory and stall the process, so it belongs on an
+internal interface in a real deployment.
+
+## Try it
+
+Copy-paste, in order. Every command below was run against the running stack and
+the outputs are real. `jq` is used for readability — `brew install jq` if you
+do not have it, or drop the pipes and read the raw JSON.
+
+### 1 — Create an account and get a token
+
+```bash
+export EMAIL="you-$(date +%s)@example.com"
+export PASSWORD="correct-horse-battery"
+
+curl -s -X POST localhost:8080/api/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Ittikorn\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}"
+```
+
+```json
+{
+  "id": "6a86d38010080d03d24116bc",
+  "name": "Ittikorn",
+  "email": "you-1787220864@example.com",
+  "created_at": "2026-08-20T10:14:24.851726294Z"
+}
+```
+
+No password field, in this or any other response. The wire types have nowhere
+to put one, so a hash cannot leak by accident.
+
+```bash
+export TOKEN=$(curl -s -X POST localhost:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" | jq -r .token)
+
+echo "${TOKEN:0:40}..."
+```
+
+### 2 — Open a shop on the **seller** service
+
+The token came from the user service on port 8080; the seller service on 8081
+accepts it without either service talking to the other.
+
+```bash
+export SHOP="Dodo Ceramics $(date +%s)"
+
+curl -s -X POST localhost:8081/api/v1/sellers \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"shop_name\":\"$SHOP\"}"
+```
+
+```json
+{
+  "id": "6a86d3a05330db8838b9f8c4",
+  "user_id": "6a86d38010080d03d24116bc",
+  "shop_name": "Dodo Ceramics 1787220896",
+  "status": "active",
+  "created_at": "2026-08-20T10:14:56.871416254Z"
+}
+```
+
+```bash
+export SELLER_ID=$(curl -s localhost:8081/api/v1/sellers/me \
+  -H "Authorization: Bearer $TOKEN" | jq -r .id)
+```
+
+The owner is taken from the token, never from the body — you cannot open a shop
+in somebody else's name.
+
+### 3 — List a product on the **product** service
+
+```bash
+curl -s -X POST localhost:8082/api/v1/products \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"Blue Ceramic Mug","description":"320ml, dishwasher safe",
+       "price_minor":25000,"currency":"THB","stock":12}'
+```
+
+```json
+{
+  "id": "6a86d3a23999619ac426af61",
+  "seller_id": "6a86d3a05330db8838b9f8c4",
+  "seller_name": "Dodo Ceramics 1787220896",
+  "name": "Blue Ceramic Mug",
+  "price_minor": 25000,
+  "currency": "THB",
+  "stock": 12,
+  "created_at": "2026-08-20T10:14:58.019944004Z"
+}
+```
+
+**Look at `seller_name`.** You did not send it, and the product service did not
+ask the seller service for it. It arrived over Kafka a moment after the shop was
+created, and the product service keeps its own copy.
+
+Two consequences worth seeing for yourself:
+
+```bash
+export PRODUCT_ID=$(curl -s "localhost:8082/api/v1/products?limit=1" | jq -r '.products[0].id')
+
+# The catalogue is public. No token.
+curl -s "localhost:8082/api/v1/products/$PRODUCT_ID" | jq '{name, seller_name}'
+```
+
+If you are quick enough to create a product before the event lands, you get a
+**409**, not a wrong answer:
+
+```json
+{"error":"no shop is registered for this account yet; if you have just created one, retry shortly"}
+```
+
+That is eventual consistency being honest rather than inventing a blank name.
+
+### 4 — Rename the shop and watch the product follow
+
+This is the whole point of the event stream.
+
+```bash
+curl -s -X PATCH "localhost:8081/api/v1/sellers/$SELLER_ID" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"shop_name":"Dodo Pottery"}' | jq -r .shop_name
+
+# Poll the product service. It has not been told anything directly.
+for i in $(seq 1 20); do
+  sleep 0.4
+  curl -s "localhost:8082/api/v1/products/$PRODUCT_ID" | jq -r .seller_name
+done | uniq
+```
+
+```
+Dodo Ceramics 1787220896
+Dodo Pottery
+```
+
+Measured at **~400ms** locally. The seller service published, the product
+service consumed, updated every product that shop owns, and dropped exactly
+those entries from Redis. Neither service made a request to the other.
+
+To watch that happen rather than infer it, see [Watching the event flow](#watching-the-event-flow).
+
+### 5 — The same user over gRPC
+
+The user service exposes `CreateUser` and `GetUser` on port 9090. Reflection is
+registered, so grpcurl needs no copy of the `.proto`:
+
+```bash
+brew install grpcurl
+
+grpcurl -plaintext localhost:9090 list
+grpcurl -plaintext localhost:9090 describe user.v1.UserService
+```
+
+```
+user.v1.UserService is a service:
+service UserService {
+  rpc CreateUser ( .user.v1.CreateUserRequest ) returns ( .user.v1.CreateUserResponse );
+  rpc GetUser ( .user.v1.GetUserRequest ) returns ( .user.v1.GetUserResponse );
+}
+```
+
+**The token travels in metadata, not in an HTTP header** — the one part of
+authentication that genuinely differs between the two adapters:
+
+```bash
+export USER_ID=$(curl -s localhost:8080/api/v1/users -H "Authorization: Bearer $TOKEN" | jq -r '.users[0].id')
+
+grpcurl -plaintext -H "authorization: Bearer $TOKEN" \
+  -d "{\"id\":\"$USER_ID\"}" localhost:9090 user.v1.UserService/GetUser
+```
+
+```json
+{
+  "user": {
+    "id": "6a86d38010080d03d24116bc",
+    "name": "Ittikorn",
+    "email": "you-1787220864@example.com",
+    "createdAt": "2026-08-20T10:14:24.851Z"
+  }
+}
+```
+
+```bash
+grpcurl -plaintext -H "authorization: Bearer $TOKEN" \
+  -d '{"name":"Somchai","email":"somchai@example.com","password":"another-long-enough-password"}' \
+  localhost:9090 user.v1.UserService/CreateUser
+```
+
+The gRPC surface is deliberately **not** a mirror of the REST one. There is no
+`Login` and there never will be: a service must never authenticate *as* a user,
+it propagates the user's token. See [docs/tech-stack.md](docs/tech-stack.md).
+
+### 6 — The failures are worth trying too
+
+The same domain error becomes an HTTP status or a gRPC code depending on which
+adapter you reach it through. The service that raised it knows about neither.
+
+```bash
+# No token
+grpcurl -plaintext -d "{\"id\":\"$USER_ID\"}" localhost:9090 user.v1.UserService/GetUser
+#   Code: Unauthenticated
+
+# Malformed ID, then a well-formed one that does not exist
+grpcurl -plaintext -H "authorization: Bearer $TOKEN" -d '{"id":"not-an-object-id"}' \
+  localhost:9090 user.v1.UserService/GetUser
+#   Code: InvalidArgument
+grpcurl -plaintext -H "authorization: Bearer $TOKEN" -d '{"id":"000000000000000000000000"}' \
+  localhost:9090 user.v1.UserService/GetUser
+#   Code: NotFound
+```
+
+```bash
+# Duplicate email -> 409, raised by the MongoDB unique index, not a
+# read-then-write check, which would race under concurrent registration.
+curl -s -X POST localhost:8080/api/v1/auth/register -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Dup\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}"
+# {"error":"email already registered"}
+
+# Validation -> 400, naming every offending field at once
+curl -s -X POST localhost:8080/api/v1/auth/register -H 'Content-Type: application/json' \
+  -d '{"name":"","email":"nope","password":"x"}'
+```
+
+```json
+{
+  "error": "validation failed",
+  "fields": {
+    "email": "must be a valid email address",
+    "name": "is required",
+    "password": "must be at least 8 characters"
+  }
+}
+```
+
+```bash
+# Somebody else's product -> 403
+# {"error":"this product belongs to another shop"}
+
+# A wrong password and an unknown email give an identical 401, so login cannot
+# be used to discover which addresses are registered.
+curl -s -X POST localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"wrong\"}"
+curl -s -X POST localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"nobody@example.com","password":"whatever"}'
+# both: {"error":"invalid credentials"}
+```
+
+### 7 — Watching the event flow
+
+An event-driven system is hard to reason about precisely because the interesting
+part happens between the services rather than inside either one. `make docker-run`
+starts a Kafka browser for exactly that:
+
+```bash
+make kafka-ui        # or open http://localhost:8090
+```
+
+**Topics → `seller.events` → Messages** shows every event the seller service has
+published, newest first, with its key and payload:
+
+```json
+{
+  "type": "seller.updated",
+  "seller_id": "6a86ca74786fc05be09fca6e",
+  "user_id": "6a86ca746884bbe1083d9703",
+  "shop_name": "Renamed Shop",
+  "status": "active",
+  "occurred_at": "2026-08-20T09:36:40.531951927Z"
+}
+```
+
+Three things there are worth noticing:
+
+- **The key is the seller ID**, visible in the Key column. Ordering in Kafka is
+  per partition, so keying by the entity is what stops two renames of one shop
+  from being applied backwards.
+- **`user_id` travels with the event.** That is what lets the product service
+  answer "which shop does this caller own?" from its own database instead of
+  calling the seller service on every write.
+- **One topic carries both event types**, discriminated by `type`. A consumer
+  that only cares about renames reads the whole topic and ignores the rest,
+  which is what lets the publisher add an event type without coordinating.
+
+**Consumers → `product-service`** shows the consumer group: its state, its
+members, and its **lag**. Lag is the number the health of an event-driven system
+lives or dies by — a lag that climbs means the consumer is falling behind the
+producer, and no amount of green health checks will tell you that.
+
+Rename a shop with the stack open on that page and watch the offset advance.
+
+> The UI is a development tool with no authentication configured. It belongs on
+> a laptop or an internal network, never on a public one.
+
+### 8 — Look at what it is doing
+
+```bash
+# Cache hit rate on the product service
+curl -s localhost:6062/metrics | grep product_cache_lookups_total
+
+# Request rate, latency and status, labelled by route pattern — never by raw
+# path, which would mint a time series per product ID.
+curl -s localhost:6062/metrics | grep http_requests_total
+
+# Profiling, on the admin port only
+go tool pprof http://localhost:6062/debug/pprof/heap
+
+# The API port does not serve it: 404
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8082/debug/pprof/heap
+```
+
+Every log line for a request carries the same `request_id`, and the header is
+echoed back so you can follow one request through:
+
+```bash
+curl -s -D- -o /dev/null localhost:8080/healthz -H 'X-Request-ID: trace-me-123' | grep -i x-request-id
+make docker-logs SERVICE=user
+```
+
+Full request collections: [test/http/api.http](test/http/api.http) for REST
+(VS Code REST Client), [test/grpc/requests.md](test/grpc/requests.md) for gRPC.
+
+## JWT
+
+Tokens are issued **only** by the user service, signed **HS256** with
+`JWT_SECRET`, and valid for `JWT_TTL` (default 24h).
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"correct-horse-battery"}' | jq -r .token)
+```
+
+| Where | How to send it |
+|---|---|
+| REST | `Authorization: Bearer <token>` |
+| gRPC | metadata key `authorization`, value `Bearer <token>` |
+
+The payload carries `sub` (the user ID), `iat`, and `exp` — nothing else, and
+never anything secret. It is signed, not encrypted; anyone holding it can read it.
+
+```bash
+# JWT uses base64url without padding, which `base64 -d` will not accept.
+decode() { python3 -c 'import base64,sys,json;s=sys.stdin.read().strip();print(json.dumps(json.loads(base64.urlsafe_b64decode(s+"="*(-len(s)%4))),indent=2))'; }
+
+echo "$TOKEN" | cut -d. -f1 | decode   # header
+echo "$TOKEN" | cut -d. -f2 | decode   # payload
+```
+
+```json
+{ "alg": "HS256", "typ": "JWT" }
+{
+  "sub": "6a86d38010080d03d24116bc",
+  "exp": 1787307265,
+  "iat": 1787220865
+}
+```
+
+Verification pins the algorithm before anything else. Accepting the algorithm a
+token names is the classic JWT bypass — a token declaring `alg: none` carries no
+signature, and one declaring `RS256` can be signed with the public key as an
+HMAC secret. There is a test for both.
+
+All three services verify with the same secret today. In production the issuer
+should hold a **private** key and the others only the public one, so that a
+compromised product service cannot mint tokens.
+
+## API
+
+### user — `:8080`
+
+| Method | Path | Auth |
+|---|---|---|
+| POST | `/api/v1/auth/register` | public |
+| POST | `/api/v1/auth/login` | public |
+| GET | `/api/v1/users` | bearer |
+| POST | `/api/v1/users` | bearer |
+| GET | `/api/v1/users/{id}` | bearer |
+| PATCH | `/api/v1/users/{id}` | bearer, self only |
+| DELETE | `/api/v1/users/{id}` | bearer, self only |
+
+gRPC on `:9090` — `user.v1.UserService/CreateUser`, `.../GetUser`.
+
+### seller — `:8081`
+
+| Method | Path | Auth |
+|---|---|---|
+| POST | `/api/v1/sellers` | bearer |
+| GET | `/api/v1/sellers` | bearer |
+| GET | `/api/v1/sellers/me` | bearer |
+| GET | `/api/v1/sellers/{id}` | bearer |
+| PATCH | `/api/v1/sellers/{id}` | bearer, owner only |
+
+### product — `:8082`
+
+| Method | Path | Auth |
+|---|---|---|
+| GET | `/api/v1/products` | **public** |
+| GET | `/api/v1/products/{id}` | **public** |
+| POST | `/api/v1/products` | bearer |
+| PATCH | `/api/v1/products/{id}` | bearer, owner only |
+| DELETE | `/api/v1/products/{id}` | bearer, owner only |
+
+### Every service
+
+`GET /healthz` (liveness), `GET /readyz` (readiness), and on the admin port
+`GET /metrics` and `/debug/pprof/`.
+
+### Conventions
+
+- JSON field names are `snake_case`.
+- Errors are `{"error": "..."}`, with a `fields` object on validation failures.
+- **PATCH, not PUT** — an omitted field is left alone, which a struct of plain
+  strings could not express.
+- Money is an integer count of **minor units** (`price_minor`) plus a currency
+  code. Never a float: `0.1 + 0.2` is not `0.3` in binary floating point.
+- **400** for a malformed ID, **404** for a well-formed one that does not exist.
+- A malformed JSON body is **400**, never 500.
+
+## Design decisions and assumptions
+
+**Three services, not one.** Each owns a database and a binary. They communicate
+only by events, which is what makes them deployable and scalable apart.
+
+**Ports and adapters.** A domain's core imports neither `net/http`, nor the
+MongoDB driver, nor generated protobuf code. Everything infrastructural arrives
+through an interface the domain declares. This is enforced by a test —
+`internal/user/architecture_test.go` reads the package's imports and fails on
+any of them.
+
+**REST and gRPC are not alternatives.** REST faces clients: browsers cannot speak
+gRPC without a proxy, and being able to replay a request with curl at 3am
+matters. gRPC faces services, where protobuf and HTTP/2 multiplexing pay off.
+Both are driving adapters over one service with no branch inside it.
+
+**Email uniqueness is a database index, not an application check.** A
+read-then-write check is passed by both of two concurrent registrations. There
+is an integration test that fires eight simultaneous registrations and asserts
+exactly one succeeds.
+
+**Login answers identically for a wrong password and an unknown email** — and
+still performs a comparison on the unknown-email path, so the response time does
+not give away the answer that the message withholds.
+
+**Authorization has no role model, because the brief's entity has no role
+field.** Reads are open to any authenticated caller; writes are restricted to
+the owner. There is no administrator. `Server.requireSelf` and
+`Service.AuthorizeOwner` are the whole rule, and
+[docs/user-domain-design.md](docs/user-domain-design.md) records the alternative
+that was considered.
+
+**Product holds a copy of the shop name.** A listing page renders hundreds of
+products; asking the seller service for each one would be hundreds of calls to
+render one page. The copy is kept honest by events. The cost is eventual
+consistency, and the API states it rather than hiding it.
+
+**The cache is a decorator over the repository port,** so the service is written
+as though it does not exist and turning it off is one line. Redis failures fall
+through to MongoDB: a cache that fails the request when it is unavailable has
+become a dependency and made availability worse.
+
+**Liveness and readiness are different endpoints.** A failing Kubernetes liveness
+probe restarts the pod, so a database check there turns a brief outage into a
+restart loop across every instance. `/healthz` checks nothing; `/readyz` checks
+dependencies.
+
+**Configuration fails fast and reports every problem at once.** There is no
+default for `JWT_SECRET` or `MONGO_URI`. A service that starts with a guessed
+security parameter is worse than one that refuses to start.
+
+### Known limitations
+
+Stated because they are real, not because they are hypothetical:
+
+- **A publish that fails after a successful write loses the event.** The write is
+  already committed, so failing the request would report a success as a failure.
+  The fix is a transactional outbox, and it is the first thing to add.
+- **No distributed tracing.** Request IDs correlate logs within a service; across
+  services, OpenTelemetry is the answer and is not here yet.
+- **MongoDB runs as a standalone node,** so multi-document transactions are not
+  available. This does not affect the three services built, and it blocks Order.
+- **All services share one JWT secret.** See the JWT section.
+- **Kafka topics are created with one partition,** which caps consumer parallelism
+  at one instance per group.
+
+## Testing
+
+```bash
+make test     # unit only, no infrastructure
+make itest    # everything, needs the stack up
+make lint     # gofmt + vet, exactly what CI runs
+```
+
+189 tests. Unit tests use hand-written fakes and no mocking framework —
+`service_test.go` runs the whole business-logic suite with no database and no
+HTTP, which is what the port interfaces are for.
+
+Integration tests run against real MongoDB, Redis and Kafka. They cover the
+things a fake cannot prove: the unique index under concurrent insert, cache
+invalidation, and a seller event travelling through a real broker into a real
+second service.
+
+Load tests are k6, in [test/load/](test/load/README.md):
+
+```bash
+make load-smoke   # 1 user, proves the wiring
+make load-read    # the cached catalogue read
+make load-auth    # login, which is bcrypt-bound on purpose
+```
+
+Measured: **13,818 req/s at p95 7.56ms** on the cached read, **63 req/s at p95
+257ms** on login. The 220x gap is bcrypt doing its job. The README there also
+records that the cache moves throughput by only 3% while taking MongoDB from
+685,062 reads to 4 — the value is protecting the database, not latency.
+
+## Layout
+
+```
+api/            published contracts: protobuf and event envelopes
+cmd/            one directory per service binary
+internal/
+  appserver/    the bootstrap every service shares
+  auth/         bcrypt, HS256 issue and verify, bearer middleware
+  config/       environment configuration, fails fast
+  database/     MongoDB and Redis clients
+  kafka/        publisher, consumer, topic creation
+  logging/      JSON logger with request-ID correlation
+  middleware/   request ID, Prometheus metrics, request logging
+  router/       the routing port and its chi adapter
+  admin/        metrics and pprof, on their own port
+  user/         ─┐
+  seller/        ├─ one package per domain, same seven-part shape
+  product/      ─┘
+test/
+  integration/  against real infrastructure
+  load/         k6
+  http/         REST request collection
+  grpc/         grpcurl request collection
+docs/           architecture, technology decisions, domain design
+```
+
+`chi` is reachable only from `internal/router/chirouter`: handlers are plain
+`http.HandlerFunc` and read parameters with `r.PathValue`, so swapping to echo
+means writing one adapter, not touching handlers.
+
+## Not built
+
+Order, Marketplace, and Live Commerce. Order is the interesting one — inventory
+reservation under concurrency — and it is blocked on moving MongoDB to a replica
+set first. [docs/domains.md](docs/domains.md) has the dependency order and the
+reasoning.

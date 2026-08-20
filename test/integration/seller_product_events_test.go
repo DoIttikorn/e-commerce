@@ -49,7 +49,7 @@ func waitFor(t *testing.T, what string, timeout time.Duration, check func() bool
 
 // startPipeline wires a real Seller service publishing to Kafka and a real
 // Product service consuming from it, each on its own database.
-func startPipeline(t *testing.T) (*seller.Service, *product.Service, *productmongo.Directory, context.Context) {
+func startPipeline(t *testing.T) (seller.Service, product.Service, *productmongo.Directory, context.Context) {
 	t.Helper()
 
 	brokers := kafkaBrokers(t)
@@ -95,9 +95,14 @@ func startPipeline(t *testing.T) (*seller.Service, *product.Service, *productmon
 	}
 	productSvc := product.NewService(productRepo, directory, discard())
 
-	// A group of its own per run, so the consumer starts from the beginning of
-	// the topic and cannot inherit a committed offset from an earlier test.
-	group := fmt.Sprintf("itest-product-%d", time.Now().UnixNano())
+	// One stable group, not a unique one per run.
+	//
+	// A fresh group each time replays the whole topic and leaves an abandoned
+	// group behind, which piles up in the broker and clutters any tool pointed
+	// at it. A stable group resumes from its committed offset instead, which is
+	// all these tests need: every assertion is about a seller created inside the
+	// test, and the consumer is running before that happens.
+	const group = "itest-product"
 	consumer := kafka.NewConsumer(brokers, group, sellerv1.TopicSellerEvents, discard())
 	consumer.Handle(productevents.SellerHandler(productSvc, discard()))
 

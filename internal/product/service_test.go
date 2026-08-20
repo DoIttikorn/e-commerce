@@ -83,7 +83,7 @@ func (f *fakeDirectory) ByUserID(_ context.Context, userID string) (SellerRef, e
 	return ref, nil
 }
 
-func newTestService(repo *fakeRepo, dir *fakeDirectory) *Service {
+func newTestService(repo *fakeRepo, dir *fakeDirectory) Service {
 	return NewService(repo, dir, slog.New(slog.DiscardHandler))
 }
 

@@ -70,7 +70,7 @@ func (f *fakePublisher) Publish(_ context.Context, _, key string, payload any) e
 	return nil
 }
 
-func newTestService(repo *fakeRepo, pub *fakePublisher) *Service {
+func newTestService(repo *fakeRepo, pub *fakePublisher) Service {
 	return NewService(repo, pub, slog.New(slog.DiscardHandler))
 }
 

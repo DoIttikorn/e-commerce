@@ -68,6 +68,11 @@ proto:
 docker-run:
 	@docker compose up --build --remove-orphans
 
+## kafka-ui: open the Kafka topic browser (the stack must be running)
+kafka-ui:
+	@echo "http://localhost:8090 -> Topics -> seller.events -> Messages"
+	@open http://localhost:8090 2>/dev/null || echo "open http://localhost:8090"
+
 ## docker-logs: follow the logs — make docker-logs SERVICE=product
 docker-logs:
 	@docker compose logs -f $(SERVICE)
@@ -85,4 +90,4 @@ clean:
 	@echo "Cleaning..."
 	@rm -rf bin tmp
 
-.PHONY: help all build run watch lint test itest load-smoke load-read load-auth proto docker-run docker-logs docker-down docker-clean clean
+.PHONY: help all build run watch lint test itest load-smoke load-read load-auth proto kafka-ui docker-run docker-logs docker-down docker-clean clean

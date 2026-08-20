@@ -100,7 +100,7 @@ func (t *fakeTokens) Issue(subject string) (string, time.Time, error) {
 	return "token-for-" + subject, time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), nil
 }
 
-func newTestService(repo *fakeRepo) (*Service, *fakeHasher, *fakeTokens) {
+func newTestService(repo *fakeRepo) (Service, *fakeHasher, *fakeTokens) {
 	hasher, tokens := &fakeHasher{}, &fakeTokens{}
 	svc := NewService(repo, hasher, tokens)
 	hasher.compares = 0 // NewService pre-hashes the decoy; ignore that here.

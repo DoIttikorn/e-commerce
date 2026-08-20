@@ -37,9 +37,42 @@ type TokenIssuer interface {
 	Issue(subject string) (token string, expiresAt time.Time, err error)
 }
 
-// Service holds the business rules. It knows nothing about HTTP, gRPC, or
-// MongoDB: everything it needs arrives through the three interfaces above.
-type Service struct {
+// Service is everything the User domain can do.
+//
+// The driving adapters each declare a narrower interface covering only what
+// they use — handler/ needs six methods, gapi/ needs two — which is the right
+// direction for a dependency. This one exists for the two things those cannot
+// give you: a single place that answers "what does this domain do?", and a
+// single type to fake when a test needs the whole service rather than a slice
+// of it.
+type Service interface {
+	// Register creates an account. Returns ErrEmailTaken if the address is
+	// held, from the unique index rather than a preceding read.
+	Register(ctx context.Context, in NewUser) (User, error)
+
+	// Authenticate exchanges credentials for a token. Every failure is
+	// ErrInvalidCredentials, and costs the same time, so neither the response
+	// nor its timing distinguishes an unknown address from a wrong password.
+	Authenticate(ctx context.Context, email, password string) (Token, error)
+
+	// ByID returns one user, or ErrUserNotFound / ErrInvalidID.
+	ByID(ctx context.Context, id string) (User, error)
+
+	// List returns one page and the total count, with paging clamped.
+	List(ctx context.Context, limit, offset int) (users []User, total int, err error)
+
+	// Update applies only the fields upd carries; nil means leave alone.
+	Update(ctx context.Context, id string, upd Update) (User, error)
+
+	Delete(ctx context.Context, id string) error
+
+	// Count backs the periodic user-count log.
+	Count(ctx context.Context) (int64, error)
+}
+
+// service is the implementation. It knows nothing about HTTP, gRPC, or
+// MongoDB: everything it needs arrives through the three ports above.
+type service struct {
 	repo   Repository
 	hasher Hasher
 	tokens TokenIssuer
@@ -65,9 +98,11 @@ type Token struct {
 	ExpiresAt time.Time
 }
 
+var _ Service = (*service)(nil)
+
 // NewService wires the domain to its adapters.
-func NewService(repo Repository, hasher Hasher, tokens TokenIssuer) *Service {
-	s := &Service{repo: repo, hasher: hasher, tokens: tokens}
+func NewService(repo Repository, hasher Hasher, tokens TokenIssuer) Service {
+	s := &service{repo: repo, hasher: hasher, tokens: tokens}
 
 	// A failure here would leave the decoy empty, which only costs the timing
 	// defence — never a working login — so it is not worth failing startup.
@@ -81,7 +116,7 @@ func NewService(repo Repository, hasher Hasher, tokens TokenIssuer) *Service {
 // registrations would both pass such a check and both proceed; the unique index
 // is the only guard that actually holds, so the code relies on it and the
 // adapter translates its error.
-func (s *Service) Register(ctx context.Context, in NewUser) (User, error) {
+func (s *service) Register(ctx context.Context, in NewUser) (User, error) {
 	name := strings.TrimSpace(in.Name)
 	fields := map[string]string{}
 
@@ -122,7 +157,7 @@ func (s *Service) Register(ctx context.Context, in NewUser) (User, error) {
 // Every failure returns ErrInvalidCredentials, and the unknown-email path still
 // performs a comparison, so neither the response nor its timing distinguishes
 // an unregistered address from a wrong password.
-func (s *Service) Authenticate(ctx context.Context, email, password string) (Token, error) {
+func (s *service) Authenticate(ctx context.Context, email, password string) (Token, error) {
 	normalized, ok := normalizeEmail(email)
 	if !ok {
 		// Not a validation error: a malformed address on login is answered
@@ -152,12 +187,12 @@ func (s *Service) Authenticate(ctx context.Context, email, password string) (Tok
 }
 
 // burnComparison spends the same time a real password check would.
-func (s *Service) burnComparison(password string) {
+func (s *service) burnComparison(password string) {
 	_ = s.hasher.Compare(s.decoyHash, password)
 }
 
 // ByID returns one user.
-func (s *Service) ByID(ctx context.Context, id string) (User, error) {
+func (s *service) ByID(ctx context.Context, id string) (User, error) {
 	found, err := s.repo.ByID(ctx, id)
 	if err != nil {
 		return User{}, err
@@ -166,7 +201,7 @@ func (s *Service) ByID(ctx context.Context, id string) (User, error) {
 }
 
 // List returns one page of users and the total count.
-func (s *Service) List(ctx context.Context, limit, offset int) ([]User, int, error) {
+func (s *service) List(ctx context.Context, limit, offset int) ([]User, int, error) {
 	limit, offset = ClampPage(limit, offset)
 
 	users, total, err := s.repo.List(ctx, limit, offset)
@@ -180,7 +215,7 @@ func (s *Service) List(ctx context.Context, limit, offset int) ([]User, int, err
 }
 
 // Update changes a name, an email, or both. Fields left nil are untouched.
-func (s *Service) Update(ctx context.Context, id string, upd Update) (User, error) {
+func (s *service) Update(ctx context.Context, id string, upd Update) (User, error) {
 	if upd.IsEmpty() {
 		return User{}, &ValidationError{Fields: map[string]string{
 			"body": "supply at least one of name or email",
@@ -215,12 +250,12 @@ func (s *Service) Update(ctx context.Context, id string, upd Update) (User, erro
 }
 
 // Delete removes a user.
-func (s *Service) Delete(ctx context.Context, id string) error {
+func (s *service) Delete(ctx context.Context, id string) error {
 	return s.repo.Delete(ctx, id)
 }
 
 // Count returns the total number of users, for the periodic count log.
-func (s *Service) Count(ctx context.Context) (int64, error) {
+func (s *service) Count(ctx context.Context) (int64, error) {
 	return s.repo.Count(ctx)
 }
 

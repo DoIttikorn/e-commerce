@@ -31,8 +31,34 @@ type EventPublisher interface {
 	Publish(ctx context.Context, topic, key string, payload any) error
 }
 
-// Service holds the business rules.
-type Service struct {
+// Service is everything the Seller domain can do.
+//
+// Every write that changes a shop announces it, which is the contract Product
+// and every future consumer depend on. That is a property of this interface as
+// much as of the implementation: a second implementation that stayed silent
+// would satisfy the compiler and break the system.
+type Service interface {
+	// Register opens a shop for an account. Returns ErrAlreadySeller if the
+	// account already has one, or ErrShopNameTaken — both from unique indexes.
+	// Announces seller.registered.
+	Register(ctx context.Context, in NewSeller) (Seller, error)
+
+	// ByID returns one shop, or ErrSellerNotFound / ErrInvalidID.
+	ByID(ctx context.Context, id string) (Seller, error)
+
+	// ByUserID returns the shop an account owns, or ErrSellerNotFound.
+	ByUserID(ctx context.Context, userID string) (Seller, error)
+
+	// List returns one page and the total count.
+	List(ctx context.Context, limit, offset int) (sellers []Seller, total int, err error)
+
+	// Update changes a shop name, a status, or both, and announces
+	// seller.updated. A failed write announces nothing.
+	Update(ctx context.Context, id string, upd Update) (Seller, error)
+}
+
+// service is the implementation.
+type service struct {
 	repo   Repository
 	events EventPublisher
 	log    *slog.Logger
@@ -44,13 +70,15 @@ type NewSeller struct {
 	ShopName string
 }
 
+var _ Service = (*service)(nil)
+
 // NewService wires the domain to its adapters.
-func NewService(repo Repository, events EventPublisher, log *slog.Logger) *Service {
-	return &Service{repo: repo, events: events, log: log}
+func NewService(repo Repository, events EventPublisher, log *slog.Logger) Service {
+	return &service{repo: repo, events: events, log: log}
 }
 
 // Register opens a shop for a user.
-func (s *Service) Register(ctx context.Context, in NewSeller) (Seller, error) {
+func (s *service) Register(ctx context.Context, in NewSeller) (Seller, error) {
 	fields := map[string]string{}
 
 	if strings.TrimSpace(in.UserID) == "" {
@@ -79,17 +107,17 @@ func (s *Service) Register(ctx context.Context, in NewSeller) (Seller, error) {
 }
 
 // ByID returns one shop.
-func (s *Service) ByID(ctx context.Context, id string) (Seller, error) {
+func (s *service) ByID(ctx context.Context, id string) (Seller, error) {
 	return s.repo.ByID(ctx, id)
 }
 
 // ByUserID returns the shop owned by a user.
-func (s *Service) ByUserID(ctx context.Context, userID string) (Seller, error) {
+func (s *service) ByUserID(ctx context.Context, userID string) (Seller, error) {
 	return s.repo.ByUserID(ctx, userID)
 }
 
 // List returns one page of shops.
-func (s *Service) List(ctx context.Context, limit, offset int) ([]Seller, int, error) {
+func (s *service) List(ctx context.Context, limit, offset int) ([]Seller, int, error) {
 	limit, offset = ClampPage(limit, offset)
 	return s.repo.List(ctx, limit, offset)
 }
@@ -99,7 +127,7 @@ func (s *Service) List(ctx context.Context, limit, offset int) ([]Seller, int, e
 // This is the event that matters to the rest of the system: Product keeps a
 // copy of the shop name so a listing does not have to ask who the seller is on
 // every read, and this is what keeps that copy honest.
-func (s *Service) Update(ctx context.Context, id string, upd Update) (Seller, error) {
+func (s *service) Update(ctx context.Context, id string, upd Update) (Seller, error) {
 	if upd.IsEmpty() {
 		return Seller{}, &ValidationError{Fields: map[string]string{
 			"body": "supply at least one of shop_name or status",
@@ -139,7 +167,7 @@ func (s *Service) Update(ctx context.Context, id string, upd Update) (Seller, er
 // either way. The correct fix is a transactional outbox — write the event to
 // the same database in the same transaction and have a relay publish it — and
 // that is the first thing to add when this stops being a demonstration.
-func (s *Service) announce(ctx context.Context, eventType string, seller Seller) {
+func (s *service) announce(ctx context.Context, eventType string, seller Seller) {
 	event := sellerv1.SellerEvent{
 		Type:       eventType,
 		SellerID:   seller.ID,

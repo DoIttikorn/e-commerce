@@ -17,8 +17,43 @@ const (
 	MaxPageSize     = 100
 )
 
-// Service holds the business rules.
-type Service struct {
+// Service is everything the Product domain can do.
+//
+// Note what is not here: nothing that calls another service. Create resolves
+// the shop from this domain's own copy, and that copy is maintained by
+// ApplySellerEvent — the only method a human never invokes, because the event
+// stream does.
+type Service interface {
+	// Create lists a product in the caller's own shop. Returns
+	// ErrUnknownSeller when no seller event has arrived for that account yet,
+	// which is the visible cost of replicating asynchronously.
+	Create(ctx context.Context, in NewProduct) (Product, error)
+
+	// ByID returns one product, or ErrProductNotFound / ErrInvalidID. This is
+	// the read the Redis decorator serves.
+	ByID(ctx context.Context, id string) (Product, error)
+
+	// List returns one page, optionally narrowed to a single seller.
+	List(ctx context.Context, sellerID string, limit, offset int) (products []Product, total int, err error)
+
+	// Update applies only the fields upd carries.
+	Update(ctx context.Context, id string, upd Update) (Product, error)
+
+	Delete(ctx context.Context, id string) error
+
+	// AuthorizeOwner returns ErrNotOwner unless the account owns the shop the
+	// product sits in. It lives here rather than in an adapter because it is a
+	// rule about the domain, and both adapters would otherwise implement it
+	// twice and eventually differently.
+	AuthorizeOwner(ctx context.Context, userID, productID string) error
+
+	// ApplySellerEvent folds a Seller domain event into this domain's state.
+	// It is idempotent, because at-least-once delivery makes repeats certain.
+	ApplySellerEvent(ctx context.Context, ref SellerRef) error
+}
+
+// service is the implementation.
+type service struct {
 	repo      Repository
 	directory SellerDirectory
 	log       *slog.Logger
@@ -38,9 +73,11 @@ type NewProduct struct {
 	Stock       int
 }
 
+var _ Service = (*service)(nil)
+
 // NewService wires the domain to its adapters.
-func NewService(repo Repository, directory SellerDirectory, log *slog.Logger) *Service {
-	return &Service{repo: repo, directory: directory, log: log}
+func NewService(repo Repository, directory SellerDirectory, log *slog.Logger) Service {
+	return &service{repo: repo, directory: directory, log: log}
 }
 
 // Create lists a product for sale.
@@ -49,7 +86,7 @@ func NewService(repo Repository, directory SellerDirectory, log *slog.Logger) *S
 // asking the Seller service. That is the whole point of consuming its events:
 // this write path makes no outbound call, so it does not slow down or fail
 // when another service does.
-func (s *Service) Create(ctx context.Context, in NewProduct) (Product, error) {
+func (s *service) Create(ctx context.Context, in NewProduct) (Product, error) {
 	fields := map[string]string{}
 
 	if strings.TrimSpace(in.OwnerUserID) == "" {
@@ -100,18 +137,18 @@ func (s *Service) Create(ctx context.Context, in NewProduct) (Product, error) {
 }
 
 // ByID returns one product.
-func (s *Service) ByID(ctx context.Context, id string) (Product, error) {
+func (s *service) ByID(ctx context.Context, id string) (Product, error) {
 	return s.repo.ByID(ctx, id)
 }
 
 // List returns one page, optionally narrowed to a single seller.
-func (s *Service) List(ctx context.Context, sellerID string, limit, offset int) ([]Product, int, error) {
+func (s *service) List(ctx context.Context, sellerID string, limit, offset int) ([]Product, int, error) {
 	limit, offset = ClampPage(limit, offset)
 	return s.repo.List(ctx, sellerID, limit, offset)
 }
 
 // Update changes the fields the caller supplied.
-func (s *Service) Update(ctx context.Context, id string, upd Update) (Product, error) {
+func (s *service) Update(ctx context.Context, id string, upd Update) (Product, error) {
 	if upd.IsEmpty() {
 		return Product{}, &ValidationError{Fields: map[string]string{
 			"body": "supply at least one field to change",
@@ -141,7 +178,7 @@ func (s *Service) Update(ctx context.Context, id string, upd Update) (Product, e
 }
 
 // Delete removes a product.
-func (s *Service) Delete(ctx context.Context, id string) error {
+func (s *service) Delete(ctx context.Context, id string) error {
 	return s.repo.Delete(ctx, id)
 }
 
@@ -150,7 +187,7 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 // It lives in the service rather than the handler because it is a rule about
 // the domain, and because both driving adapters would otherwise implement it
 // twice and eventually differently.
-func (s *Service) AuthorizeOwner(ctx context.Context, userID, productID string) error {
+func (s *service) AuthorizeOwner(ctx context.Context, userID, productID string) error {
 	found, err := s.repo.ByID(ctx, productID)
 	if err != nil {
 		return err
@@ -177,7 +214,7 @@ func (s *Service) AuthorizeOwner(ctx context.Context, userID, productID string) 
 // It must be idempotent. Delivery is at-least-once, so the same event will be
 // seen twice sooner or later — and both steps here are writes that produce the
 // same result whether they run once or five times.
-func (s *Service) ApplySellerEvent(ctx context.Context, ref SellerRef) error {
+func (s *service) ApplySellerEvent(ctx context.Context, ref SellerRef) error {
 	if ref.SellerID == "" {
 		// A malformed event must not stall the partition forever, so it is
 		// dropped rather than retried. It is logged as an error because an

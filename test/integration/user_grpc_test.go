@@ -23,7 +23,7 @@ const grpcTestSecret = "an-integration-test-secret-over-32-chars"
 // startGRPC builds the real stack — Mongo adapter, bcrypt, HS256, service,
 // gRPC adapter — and serves it on a real port, so this exercises the wiring
 // and the interceptor rather than the handler functions in isolation.
-func startGRPC(t *testing.T) (userv1.UserServiceClient, *user.Service, context.Context) {
+func startGRPC(t *testing.T) (userv1.UserServiceClient, user.Service, context.Context) {
 	t.Helper()
 
 	repo, ctx := newTestRepo(t)
