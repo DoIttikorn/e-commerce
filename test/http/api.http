@@ -5,10 +5,12 @@
 # @token line with a response handler:
 #   > {% client.global.set("token", response.body.token) %}
 #
-# STATUS: only /healthz is implemented. Everything below it is the intended
-# contract for the user domain, written ahead of the code on purpose so the
-# request and response shapes are decided before they are built. Expect 404
-# until the domain exists.
+# STATUS: the REST surface is implemented and verified end to end. The gRPC
+# adapter (CreateUser, GetUser) is not built yet.
+#
+# Authorization model: reads are open to any authenticated caller; PATCH and
+# DELETE are restricted to the caller's own account and answer 403 otherwise.
+# See docs/user-domain-design.md, "Open question", for why.
 
 @baseUrl = http://localhost:8080
 @adminUrl = http://localhost:6060
@@ -55,7 +57,7 @@ GET {{baseUrl}}/debug/pprof/
 
 
 ###############################################################################
-# Auth — not implemented yet
+# Auth — implemented
 ###############################################################################
 
 ### Register a new account. Public.
@@ -100,7 +102,7 @@ Content-Type: {{contentType}}
 
 
 ###############################################################################
-# Users — not implemented yet. All require a valid JWT.
+# Users — implemented. All require a valid JWT.
 ###############################################################################
 
 ### List users.
@@ -201,3 +203,14 @@ Content-Type: {{contentType}}
 ### that does not exist — a distinction worth getting right.
 GET {{baseUrl}}/api/v1/users/not-an-object-id
 Authorization: Bearer {{token}}
+
+### Modifying another account. Expect 403 under the authorization model in
+### docs/user-domain-design.md: there is no role field, so there is no
+### administrator, and a caller may only change their own record.
+PATCH {{baseUrl}}/api/v1/users/000000000000000000000001
+Authorization: Bearer {{token}}
+Content-Type: {{contentType}}
+
+{
+  "name": "Hijacked"
+}

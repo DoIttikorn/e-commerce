@@ -31,7 +31,7 @@ Local-only, not committed (see `.gitignore`):
 
 ## Current state
 
-**The skeleton is built and green; no domain is written yet.**
+**The User domain is built, wired, and verified end to end. No other domain exists.**
 
 In place and passing `make lint` and `make test`:
 
@@ -46,8 +46,14 @@ In place and passing `make lint` and `make test`:
 - `cmd/api/main.go` — wiring, `/healthz` + `/readyz`, graceful shutdown of both servers
 - `Makefile`, `Dockerfile`, `docker-compose.yml`, `.github/workflows/ci.yml`,
   `.air.toml`, `.env.example`, `.gitignore`, `.dockerignore`
+- `internal/user` — entity, service, `Repository` port, `mongodb` driven adapter,
+  `handler` REST driving adapter, and the ten-second `CountLogger`
+- `internal/auth` — bcrypt hashing, HS256 issue/verify, bearer middleware
+- `test/integration` — repository tests against a real MongoDB, including the
+  unique index under concurrent insert
 
-Not written yet: every domain package, `internal/auth`, and `api/`.
+Not written yet: `internal/user/gapi` and `api/user/v1` (the gRPC adapter), and
+every other domain.
 
 ### Design before domain
 
@@ -60,8 +66,7 @@ Done so far:
 
 - [docs/user-domain-design.md](docs/user-domain-design.md) — the User domain:
   entity, actors, nine user stories with acceptance criteria, four sequence
-  diagrams, and the decisions behind them. **It ends with one open question
-  (authorization model) that must be answered before the handlers are written.**
+  diagrams, and the decisions behind them.
 - [docs/tech-stack.md](docs/tech-stack.md) — why each technology is here,
   what it costs, and the known gaps.
 
@@ -337,8 +342,15 @@ two in step: change the contract there and here together.
 | GET | `/api/v1/users` | bearer |
 | POST | `/api/v1/users` | bearer |
 | GET | `/api/v1/users/{id}` | bearer |
-| PATCH | `/api/v1/users/{id}` | bearer |
-| DELETE | `/api/v1/users/{id}` | bearer |
+| PATCH | `/api/v1/users/{id}` | bearer, self only |
+| DELETE | `/api/v1/users/{id}` | bearer, self only |
+
+**Authorization** follows option B from the design document: reads are open to
+any authenticated caller, while PATCH and DELETE are restricted to the token's
+own subject and answer **403** otherwise. The brief's entity has no role field,
+so there is no administrator to grant wider rights to. The whole rule is
+`Server.requireSelf` in `internal/user/handler/server.go` — reverting to "any
+authenticated caller may act on any user" is deleting its two call sites.
 
 Conventions:
 

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,11 +23,15 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"github.com/DoIttikorn/e-commerce/internal/admin"
+	"github.com/DoIttikorn/e-commerce/internal/auth"
 	"github.com/DoIttikorn/e-commerce/internal/config"
 	"github.com/DoIttikorn/e-commerce/internal/database"
 	"github.com/DoIttikorn/e-commerce/internal/logging"
 	"github.com/DoIttikorn/e-commerce/internal/middleware"
 	"github.com/DoIttikorn/e-commerce/internal/router/chirouter"
+	"github.com/DoIttikorn/e-commerce/internal/user"
+	userhandler "github.com/DoIttikorn/e-commerce/internal/user/handler"
+	usermongo "github.com/DoIttikorn/e-commerce/internal/user/mongodb"
 )
 
 const (
@@ -36,6 +41,9 @@ const (
 
 	// readinessTimeout keeps a probe from hanging on a wedged dependency.
 	readinessTimeout = 2 * time.Second
+
+	// countInterval is the ten seconds the brief asks for.
+	countInterval = 10 * time.Second
 )
 
 func main() {
@@ -85,6 +93,23 @@ func run() error {
 		slog.Bool("kafka_configured", cfg.Kafka.Enabled()),
 	)
 
+	// --- User domain ------------------------------------------------------
+	//
+	// The wiring below is the hexagon made concrete: a driven adapter and two
+	// credential adapters are handed to a service that imports none of them.
+
+	userRepo := usermongo.NewRepository(db)
+	// Creating the unique index at startup rather than by migration keeps the
+	// guarantee with the code that depends on it. It is idempotent.
+	if err := userRepo.EnsureIndexes(startupCtx); err != nil {
+		return err
+	}
+
+	tokens := auth.NewTokens(cfg.JWTSecret, cfg.JWTTTL)
+	userSvc := user.NewService(userRepo, auth.NewHasher(auth.DefaultCost), tokens)
+
+	// --- Observability ----------------------------------------------------
+
 	// A dedicated registry rather than the package-level default: no global
 	// state, and the Go and process collectors are registered where they can
 	// be seen, since runtime metrics are most of what performance work needs.
@@ -94,6 +119,8 @@ func run() error {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 	metrics := middleware.NewMetrics(registry)
+
+	// --- HTTP -------------------------------------------------------------
 
 	r := chirouter.New()
 	// Order matters: RequestID first so the metrics and log lines for a request
@@ -106,10 +133,7 @@ func run() error {
 	r.Handle(http.MethodGet, "/healthz", liveness)
 	r.Handle(http.MethodGet, "/readyz", readiness(db))
 
-	// Domain wiring goes here once a domain exists:
-	//   repo := usermongodb.NewRepository(db)
-	//   svc  := user.NewService(repo, tokens)
-	//   userhandler.New(svc).Register(r)
+	userhandler.New(userSvc, log).Register(r, auth.Middleware(tokens))
 
 	apiSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -121,6 +145,15 @@ func run() error {
 		Handler:           admin.NewHandler(registry),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+
+	// --- Background work --------------------------------------------------
+
+	var background sync.WaitGroup
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		user.NewCountLogger(userSvc, log, countInterval).Run(ctx)
+	}()
 
 	// Buffered for both servers so neither goroutine leaks if the other fails first.
 	serveErr := make(chan error, 2)
@@ -147,6 +180,10 @@ func run() error {
 	if err := adminSrv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("admin shutdown: %w", err)
 	}
+
+	// Waited on before the deferred Disconnect runs, so the counter cannot be
+	// midway through a query when the client closes underneath it.
+	background.Wait()
 	return nil
 }
 
