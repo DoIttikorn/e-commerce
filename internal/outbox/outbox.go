@@ -19,6 +19,9 @@ import (
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -44,6 +47,17 @@ type document struct {
 	PublishedAt *time.Time    `bson:"published_at"`
 	ClaimedAt   *time.Time    `bson:"claimed_at"`
 	Attempts    int           `bson:"attempts"`
+
+	// TraceContext is the W3C trace context of the request that produced this
+	// event, stored so the relay can publish it under the same trace seconds
+	// later. Without it the outbox is where every trace ends: the request
+	// finishes, its context is gone, and whatever the event goes on to cause
+	// looks unrelated to whoever caused it.
+	//
+	// It is a map rather than a bare traceparent string so a change of
+	// propagator — B3, or baggage alongside it — is a configuration change
+	// rather than a migration.
+	TraceContext map[string]string `bson:"trace_context,omitempty"`
 }
 
 // EnsureIndexes creates what the relay's query needs.
@@ -81,6 +95,15 @@ func Append(ctx context.Context, coll *mongo.Collection, events []Event) error {
 		return nil
 	}
 
+	// Captured once for the whole batch: they were all produced by this one
+	// request, and injecting per event would record the same values n times.
+	//
+	// Taken from ctx rather than passed in, which means no service or domain
+	// has to know tracing exists to be traced. With tracing off the carrier is
+	// empty and omitempty keeps it out of the document entirely.
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+
 	docs := make([]any, 0, len(events))
 	for _, e := range events {
 		created := e.CreatedAt
@@ -88,10 +111,11 @@ func Append(ctx context.Context, coll *mongo.Collection, events []Event) error {
 			created = time.Now().UTC()
 		}
 		docs = append(docs, document{
-			Topic:       e.Topic,
-			Key:         e.Key,
-			PayloadJSON: string(e.Payload),
-			CreatedAt:   created,
+			Topic:        e.Topic,
+			Key:          e.Key,
+			PayloadJSON:  string(e.Payload),
+			CreatedAt:    created,
+			TraceContext: carrier,
 		})
 	}
 

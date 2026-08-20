@@ -50,8 +50,10 @@ curl -s localhost:8082/readyz    # {"status":"ready"}
 | **marketplace** | 8084 | — | 6064 | 27021 | search projection from three streams |
 | **live** | 8085 | — | 6065 | 27022 | WebSocket; Redis presence and broadcast |
 
-Plus **Kafka UI on [localhost:8090](http://localhost:8090)** — a development
-tool for watching the event flow, described below.
+Plus two development tools, both described below: **Kafka UI on
+[localhost:8090](http://localhost:8090)** for watching the event flow, and
+**Jaeger on [localhost:16686](http://localhost:16686)** for following one
+request across every service it touches.
 
 Each owns a **separate MongoDB instance**, not a separate database on a shared
 server. Connection limits, cache, lock contention, backups, version upgrades and
@@ -62,6 +64,13 @@ Every instance is a single-node replica set, because transactions and change
 streams both need an oplog. From the host, connect with `directConnection=true`:
 each set advertises its member as `mongo-<service>:27017`, a name that resolves
 inside the compose network and nowhere else.
+
+One member is a development convenience and buys no redundancy. The code is
+written for more: the driver is configured for `majority` writes and reads, so
+an acknowledged write survives a failover and a read never returns something an
+election could erase. On a one-member set `majority` is identical to `w:1` and
+costs nothing — which is why it is set now, rather than being a change somebody
+has to remember when members are added.
 
 The admin port carries Prometheus metrics and pprof. It is never the API port —
 pprof can dump process memory and stall the process, so it belongs on an
@@ -517,7 +526,67 @@ Rename a shop with the stack open on that page and watch the offset advance.
 > The UI is a development tool with no authentication configured. It belongs on
 > a laptop or an internal network, never on a public one.
 
-### 11 — Look at what it is doing
+### 11 — Follow one order across all six services
+
+A request ID ties together the log lines of one request *inside* one process.
+The moment the work crosses a gRPC call or an event, it stops. Placing an order
+touches Order, Product, the outbox, Kafka, and Marketplace — five hops and four
+processes — and a request ID gets you through none of them.
+
+`make docker-run` starts Jaeger for that:
+
+```bash
+make traces          # or open http://localhost:16686
+```
+
+Place an order (step 7 above), then pick **Service: order**, **Operation:
+POST /api/v1/orders**, and **Find Traces**. One trace, and reading down it:
+
+```
+POST /api/v1/orders                          order        142ms
+├── product.v1.StockService/Reserve          order         38ms   (client)
+│   └── product.v1.StockService/Reserve      product       31ms   (server)
+├── product.v1.StockService/Confirm          order          6ms
+└── outbox publish order.events              order          9ms   (producer)
+    └── consume order.events                 marketplace    4ms   (consumer)
+```
+
+The last two lines are the ones worth the effort. The publish did not happen
+during the request — the request wrote the event into the outbox inside its
+transaction and returned, and a background relay published it afterwards. The
+trace context is stored in the outbox row and replayed by the relay, so the
+event and the checkout that caused it are one trace instead of two unrelated
+log streams and a timestamp comparison.
+
+Two more things to try:
+
+```bash
+# Every log line carries trace_id and span_id, so a line found in the logs and
+# the whole distributed request are one paste apart.
+make docker-logs SERVICE=order | grep trace_id | head -1
+
+# Send your own trace ID in and watch it come back out in the logs.
+curl -s -o /dev/null localhost:8083/healthz \
+  -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'
+make docker-logs SERVICE=order | grep 4bf92f3577b34da6a3ce929d0e0e4736
+```
+
+The second one is the whole contract in one command: a trace started somewhere
+else — an API gateway, a mobile client, another team's service — is continued
+here rather than replaced.
+
+Span names are route patterns, never paths: `GET /api/v1/users/{id}`, not
+`GET /api/v1/users/68f1…`. That is the same rule the Prometheus labels follow
+and for the same reason — one span name per user ID is unbounded cardinality in
+the trace backend, where it costs indexing and money rather than a crash. It is
+also why the HTTP instrumentation here is hand-written instead of `otelhttp`:
+the standard middleware names a span before the router has matched, so the only
+name available to it is the raw path.
+
+> Jaeger `all-in-one` keeps traces in memory and loses them on restart, which is
+> right for a laptop and wrong everywhere else.
+
+### 12 — Look at what it is doing
 
 ```bash
 # Cache hit rate on the product service
@@ -758,18 +827,25 @@ disaster for an order.
 
 Stated because they are real, not because they are hypothetical:
 
-- **A publish that fails after a successful write loses the event.** The write is
-  already committed, so failing the request would report a success as a failure.
-  The fix is a transactional outbox, and it is the first thing to add.
-- **No distributed tracing.** Request IDs correlate logs within a service; across
-  services, OpenTelemetry is the answer and is not here yet.
-- **No reaper for stranded reservations.** A crash between reserving stock and
-  writing the order holds stock against nothing until somebody notices.
-- **Single-node replica sets and one Kafka partition per topic.** The first buys
-  no redundancy; the second caps consumer parallelism at one instance per group.
-- **All services share one JWT secret.** See the JWT section.
-- **Kafka topics are created with one partition,** which caps consumer parallelism
-  at one instance per group.
+- **Single-node replica sets and a single Kafka broker.** Each service's MongoDB
+  is a one-member set: enough for transactions and change streams, no redundancy
+  whatsoever. Kafka is one broker at `replicationFactor: 1`. Both are deployment
+  decisions rather than code ones — the URIs already name replica sets, the
+  driver is configured for `majority` reads and writes, and topics are created
+  with `KAFKA_PARTITIONS` (default 3) — but on a laptop they are single points
+  of failure and worth saying so.
+- **No dead-letter topic.** A message a consumer cannot handle is retried
+  forever and blocks its partition behind it. A retry budget plus a DLQ is the
+  fix, and it is the next thing to add.
+- **No rate limiting or circuit breaking.** The Order → Product call has a
+  five-second timeout but no breaker, so a Product service that is slow rather
+  than down is absorbed one checkout at a time. Redis is already wired and is
+  where a distributed limiter belongs.
+- **Nothing watches the outbox depth.** `outbox.PendingCount` is the number to
+  page on: a relay that has stopped looks exactly like an idle one until it
+  climbs. The metric is available; no alert consumes it.
+- **Traces are sampled at 100%,** which is right for a laptop and the first
+  number to turn down under real traffic (`OTEL_TRACES_SAMPLER_ARG`).
 
 ## Testing
 
@@ -808,13 +884,16 @@ api/            published contracts: protobuf and event envelopes
 cmd/            one directory per service binary
 internal/
   appserver/    the bootstrap every service shares
-  auth/         bcrypt, HS256 issue and verify, bearer middleware
+  auth/         bcrypt, HS256 and EdDSA issue and verify, bearer middleware
   config/       environment configuration, fails fast
   database/     MongoDB and Redis clients
-  kafka/        publisher, consumer, topic creation
-  logging/      JSON logger with request-ID correlation
-  middleware/   request ID, Prometheus metrics, request logging
+  kafka/        publisher, consumer, topic creation, trace headers
+  logging/      JSON logger with request-ID and trace-ID correlation
+  middleware/   request ID, tracing, Prometheus metrics, request logging
+  outbox/       transactional outbox and its relay
   router/       the routing port and its chi adapter
+  servicetls/   mutual TLS for the internal gRPC link
+  tracing/      OpenTelemetry setup and propagation
   admin/        metrics and pprof, on their own port
   user/         ─┐
   seller/        ├─ one package per domain, same seven-part shape

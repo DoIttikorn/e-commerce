@@ -219,3 +219,114 @@ func TestReleaseIsIdempotentAndForgiving(t *testing.T) {
 		t.Errorf("stock = %d, want 10 — repeated releases conjured stock", after.Stock)
 	}
 }
+
+// The reaper closes the one window the ordering saga cannot: a caller that
+// takes stock and then dies before recording why. Nothing in the caller can
+// help, because the caller is the thing that died.
+func TestUnconfirmedReservationsAreReclaimed(t *testing.T) {
+	repo, ctx := newStockRepo(t)
+	item := seedStock(t, ctx, repo, "Abandoned", 10)
+
+	if _, err := repo.Reserve(ctx, "order-abandoned", []product.ReserveItem{{ProductID: item.ID, Quantity: 4}}); err != nil {
+		t.Fatalf("Reserve() error = %v", err)
+	}
+	if after, _ := repo.ByID(ctx, item.ID); after.Stock != 6 {
+		t.Fatalf("stock = %d, want 6 immediately after reserving", after.Stock)
+	}
+
+	// Nothing confirmed it, so anything older than an instant is fair game.
+	released, err := repo.ReleaseExpired(ctx, 0)
+	if err != nil {
+		t.Fatalf("ReleaseExpired() error = %v", err)
+	}
+	if released != 1 {
+		t.Errorf("released %d reservations, want 1", released)
+	}
+
+	after, _ := repo.ByID(ctx, item.ID)
+	if after.Stock != 10 {
+		t.Errorf("stock = %d, want 10 — the abandoned reservation was not reclaimed", after.Stock)
+	}
+}
+
+// A confirmed reservation belongs to a real order and must survive the reaper,
+// however long it has been sitting there.
+func TestConfirmedReservationsSurviveTheReaper(t *testing.T) {
+	repo, ctx := newStockRepo(t)
+	item := seedStock(t, ctx, repo, "Legitimate", 10)
+
+	if _, err := repo.Reserve(ctx, "order-real", []product.ReserveItem{{ProductID: item.ID, Quantity: 4}}); err != nil {
+		t.Fatalf("Reserve() error = %v", err)
+	}
+	if err := repo.Confirm(ctx, "order-real"); err != nil {
+		t.Fatalf("Confirm() error = %v", err)
+	}
+
+	released, err := repo.ReleaseExpired(ctx, 0)
+	if err != nil {
+		t.Fatalf("ReleaseExpired() error = %v", err)
+	}
+	if released != 0 {
+		t.Errorf("released %d confirmed reservations, want 0", released)
+	}
+
+	after, _ := repo.ByID(ctx, item.ID)
+	if after.Stock != 6 {
+		t.Errorf("stock = %d, want 6 — a paid order's stock was given away", after.Stock)
+	}
+}
+
+// The reaper runs on a timer, so it will see the same already-released
+// reservation again. Reclaiming twice would conjure stock out of nothing.
+func TestTheReaperDoesNotReclaimTwice(t *testing.T) {
+	repo, ctx := newStockRepo(t)
+	item := seedStock(t, ctx, repo, "Once", 10)
+
+	if _, err := repo.Reserve(ctx, "order-once", []product.ReserveItem{{ProductID: item.ID, Quantity: 3}}); err != nil {
+		t.Fatalf("Reserve() error = %v", err)
+	}
+	for range 3 {
+		if _, err := repo.ReleaseExpired(ctx, 0); err != nil {
+			t.Fatalf("ReleaseExpired() error = %v", err)
+		}
+	}
+
+	after, _ := repo.ByID(ctx, item.ID)
+	if after.Stock != 10 {
+		t.Errorf("stock = %d, want 10 — repeated reaping invented stock", after.Stock)
+	}
+}
+
+// The grace period is what stops an order still being written from being
+// treated as a dead one.
+func TestTheReaperRespectsTheGracePeriod(t *testing.T) {
+	repo, ctx := newStockRepo(t)
+	item := seedStock(t, ctx, repo, "Fresh", 10)
+
+	if _, err := repo.Reserve(ctx, "order-fresh", []product.ReserveItem{{ProductID: item.ID, Quantity: 2}}); err != nil {
+		t.Fatalf("Reserve() error = %v", err)
+	}
+
+	released, err := repo.ReleaseExpired(ctx, time.Hour)
+	if err != nil {
+		t.Fatalf("ReleaseExpired() error = %v", err)
+	}
+	if released != 0 {
+		t.Errorf("released %d reservations inside the grace period, want 0", released)
+	}
+
+	after, _ := repo.ByID(ctx, item.ID)
+	if after.Stock != 8 {
+		t.Errorf("stock = %d, want 8 — a fresh reservation was reaped", after.Stock)
+	}
+}
+
+// Confirming something that was never reserved must not create a record for the
+// reaper to trip over later.
+func TestConfirmingAnUnknownKeyIsHarmless(t *testing.T) {
+	repo, ctx := newStockRepo(t)
+
+	if err := repo.Confirm(ctx, "never-existed"); err != nil {
+		t.Errorf("Confirm() on an unknown key error = %v, want nil", err)
+	}
+}

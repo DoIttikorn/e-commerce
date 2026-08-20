@@ -17,6 +17,7 @@ import (
 	userv1 "github.com/DoIttikorn/e-commerce/api/user/v1"
 	"github.com/DoIttikorn/e-commerce/internal/appserver"
 	"github.com/DoIttikorn/e-commerce/internal/auth"
+	"github.com/DoIttikorn/e-commerce/internal/tracing"
 	"github.com/DoIttikorn/e-commerce/internal/user"
 	usergapi "github.com/DoIttikorn/e-commerce/internal/user/gapi"
 	userhandler "github.com/DoIttikorn/e-commerce/internal/user/handler"
@@ -52,13 +53,31 @@ func run() error {
 		return err
 	}
 
-	tokens := auth.NewTokens(app.Cfg.JWTSecret, app.Cfg.JWTTTL)
+	// The only issuer in the system. With a key pair configured it holds the
+	// private half and nothing else does, so no other service can mint a token
+	// however badly it is compromised.
+	tokens, err := auth.NewIssuerFrom(
+		app.Cfg.JWTSecret, app.Cfg.JWTPrivateKey, app.Cfg.JWTPublicKey, app.Cfg.JWTTTL)
+	if err != nil {
+		return err
+	}
+
+	// Verification uses the same object here, because this service checks the
+	// tokens it issued.
+	verifier, err := auth.NewVerifierFrom(app.Cfg.JWTSecret, app.Cfg.JWTPublicKey)
+	if err != nil {
+		return err
+	}
+
 	svc := user.NewService(repo, auth.NewHasher(auth.DefaultCost), tokens)
 
 	// Two driving adapters over one service: the hexagon made concrete.
-	userhandler.New(svc, app.Log).Register(app.Router, auth.Middleware(tokens))
+	userhandler.New(svc, app.Log).Register(app.Router, auth.Middleware(verifier))
 
-	app.GRPC = grpc.NewServer(grpc.UnaryInterceptor(usergapi.AuthInterceptor(tokens)))
+	app.GRPC = grpc.NewServer(
+		grpc.UnaryInterceptor(usergapi.AuthInterceptor(verifier)),
+		tracing.ServerOption(),
+	)
 	userv1.RegisterUserServiceServer(app.GRPC, usergapi.New(svc))
 	// Reflection lets grpcurl discover the surface without a copy of the .proto.
 	reflection.Register(app.GRPC)

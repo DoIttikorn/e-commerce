@@ -63,7 +63,7 @@ func startOrderStack(t *testing.T) (*orderStack, context.Context) {
 	go func() { _ = grpcSrv.Serve(listener) }()
 	t.Cleanup(grpcSrv.Stop)
 
-	stockClient, err := grpcstock.Dial(listener.Addr().String())
+	stockClient, err := grpcstock.Dial(listener.Addr().String(), "", "")
 	if err != nil {
 		t.Fatalf("dial product: %v", err)
 	}

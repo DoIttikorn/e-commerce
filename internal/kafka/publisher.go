@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel"
 )
 
 // Publisher writes events to Kafka.
@@ -42,6 +43,18 @@ func NewPublisher(brokers []string, log *slog.Logger) *Publisher {
 			// created deliberately, with a partition count chosen for the load.
 			AllowAutoTopicCreation: true,
 
+			// kafka-go batches, and its default BatchTimeout is one second: a
+			// lone message waits the full second before it is flushed. The
+			// outbox relay publishes one event per iteration, so the default
+			// capped it at roughly one event per second and put a second of
+			// latency on every one — which is what the first end-to-end trace
+			// showed, as a 1006ms "outbox publish" span with nothing in it.
+			//
+			// 10ms still batches under load, where several events are in flight
+			// and the window fills, and stops a single event from paying for a
+			// batch that is never going to arrive.
+			BatchTimeout: 10 * time.Millisecond,
+
 			WriteTimeout: 10 * time.Second,
 		},
 		log: log,
@@ -66,11 +79,18 @@ func (p *Publisher) Publish(ctx context.Context, topic, key string, payload any)
 // that produced it, and re-encoding it here would let a later change to the
 // event type quietly rewrite events recorded before that change.
 func (p *Publisher) PublishRaw(ctx context.Context, topic, key string, body []byte) error {
-	err := p.writer.WriteMessages(ctx, kafka.Message{
+	msg := kafka.Message{
 		Topic: topic,
 		Key:   []byte(key),
 		Value: body,
-	})
+	}
+
+	// The trace context rides in the headers, not the payload. A consumer that
+	// knows nothing about tracing still parses the event; one that does joins
+	// the trace of whatever caused it.
+	otel.GetTextMapPropagator().Inject(ctx, messageCarrier{msg: &msg})
+
+	err := p.writer.WriteMessages(ctx, msg)
 	if err != nil {
 		return fmt.Errorf("publish to %s: %w", topic, err)
 	}

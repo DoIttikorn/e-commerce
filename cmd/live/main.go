@@ -75,8 +75,14 @@ func run() error {
 
 	svc := live.NewService(repo, directory, bus, bus, app.Log)
 
-	tokens := auth.NewTokens(app.Cfg.JWTSecret, app.Cfg.JWTTTL)
-	livehandler.New(svc, bus, app.Log).Register(app.Router, auth.Middleware(tokens))
+	// Verify only. This service never issues a token, so it never needs a
+	// signing key — and with a key pair configured it could not sign one if it
+	// tried, which is the point of splitting them.
+	verifier, err := auth.NewVerifierFrom(app.Cfg.JWTSecret, app.Cfg.JWTPublicKey)
+	if err != nil {
+		return err
+	}
+	livehandler.New(svc, bus, app.Log).Register(app.Router, auth.Middleware(verifier))
 
 	subscriptions := []struct {
 		topic   string
@@ -88,7 +94,7 @@ func run() error {
 	}
 
 	for _, sub := range subscriptions {
-		if err := kafka.EnsureTopic(ctx, app.Cfg.Kafka.Brokers, sub.topic, 1); err != nil {
+		if err := kafka.EnsureTopic(ctx, app.Cfg.Kafka.Brokers, sub.topic, app.Cfg.Kafka.Partitions); err != nil {
 			return err
 		}
 

@@ -6,6 +6,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 type requestIDKey struct{}
@@ -41,6 +43,15 @@ type contextHandler struct {
 func (h *contextHandler) Handle(ctx context.Context, rec slog.Record) error {
 	if id := RequestIDFrom(ctx); id != "" {
 		rec.AddAttrs(slog.String("request_id", id))
+	}
+
+	// The trace ID is what turns a log search into a trace: find the failing
+	// line in one service, paste the ID into the trace UI, and see every other
+	// service the same request touched. Only the API is imported here, not the
+	// SDK — with tracing off this reads an empty span context and adds nothing.
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		rec.AddAttrs(slog.String("trace_id", sc.TraceID().String()))
+		rec.AddAttrs(slog.String("span_id", sc.SpanID().String()))
 	}
 	return h.Handler.Handle(ctx, rec)
 }

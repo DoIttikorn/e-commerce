@@ -7,6 +7,12 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/DoIttikorn/e-commerce/internal/tracing"
 )
 
 // Handler processes one message. Returning an error leaves the offset
@@ -80,7 +86,27 @@ func (c *Consumer) handle(ctx context.Context, msg kafka.Message) error {
 	if c.handler == nil {
 		return nil
 	}
+
+	// Continue the producer's trace rather than starting a new one. This is the
+	// hop that request IDs cannot cross at all: the producing request ended
+	// before this message was even written, so without the header there is
+	// nothing linking "the seller was renamed" to the product rows it changed.
+	ctx = otel.GetTextMapPropagator().Extract(ctx, messageCarrier{msg: &msg})
+
+	ctx, span := tracing.Tracer().Start(ctx, "consume "+msg.Topic,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination.name", msg.Topic),
+			attribute.String("messaging.kafka.message.key", string(msg.Key)),
+			attribute.Int("messaging.kafka.partition", msg.Partition),
+			attribute.Int64("messaging.kafka.offset", msg.Offset),
+		),
+	)
+	defer span.End()
+
 	if err := c.handler(ctx, msg.Key, msg.Value); err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		c.log.LogAttrs(ctx, slog.LevelError, "event handling failed",
 			slog.String("topic", msg.Topic),
 			slog.String("key", string(msg.Key)),

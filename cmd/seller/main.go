@@ -46,7 +46,7 @@ func run() error {
 	// Created up front rather than left to auto-creation on first publish, so a
 	// consumer that starts before the first seller is registered has a topic to
 	// attach to instead of waiting for one to appear.
-	if err := kafka.EnsureTopic(ctx, app.Cfg.Kafka.Brokers, sellerv1.TopicSellerEvents, 1); err != nil {
+	if err := kafka.EnsureTopic(ctx, app.Cfg.Kafka.Brokers, sellerv1.TopicSellerEvents, app.Cfg.Kafka.Partitions); err != nil {
 		return err
 	}
 
@@ -70,8 +70,14 @@ func run() error {
 		_, err := outbox.PendingCount(ctx, outboxColl)
 		return err
 	})
-	tokens := auth.NewTokens(app.Cfg.JWTSecret, app.Cfg.JWTTTL)
-	sellerhandler.New(svc, app.Log).Register(app.Router, auth.Middleware(tokens))
+	// Verify only. This service never issues a token, so it never needs a
+	// signing key — and with a key pair configured it could not sign one if it
+	// tried, which is the point of splitting them.
+	verifier, err := auth.NewVerifierFrom(app.Cfg.JWTSecret, app.Cfg.JWTPublicKey)
+	if err != nil {
+		return err
+	}
+	sellerhandler.New(svc, app.Log).Register(app.Router, auth.Middleware(verifier))
 
 	return app.Run(ctx)
 }

@@ -22,6 +22,14 @@ service StockService {
   // for a saga step that has to be undone — a cancelled order, or a payment
   // that never arrived.
   rpc Release(ReleaseRequest) returns (ReleaseResponse);
+
+  // Confirm says the reservation belongs to an order that now exists.
+  //
+  // Reservation is two-phase because of what happens when a caller dies. Stock
+  // taken and never confirmed is indistinguishable from stock taken for an
+  // order still being written — unless somebody says which. This is that. What
+  // stays unconfirmed is reclaimed by a reaper on the Product side.
+  rpc Confirm(ConfirmRequest) returns (ConfirmResponse);
 }
 
 message StockItem {
@@ -63,3 +71,9 @@ message ReleaseRequest {
 message ReleaseResponse {
   int32 released_items = 1;
 }
+
+message ConfirmRequest {
+  string idempotency_key = 1;
+}
+
+message ConfirmResponse {}

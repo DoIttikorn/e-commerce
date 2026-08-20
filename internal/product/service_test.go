@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"time"
 )
 
 type fakeRepo struct {
@@ -14,9 +15,12 @@ type fakeRepo struct {
 	reserveFn func(context.Context, string, []ReserveItem) ([]ReservedItem, error)
 	releaseFn func(context.Context, string, []ReserveItem) error
 
-	reserveKey   string
-	releasedKeys []string
-	events       []OutboxEvent
+	reserveKey      string
+	releasedKeys    []string
+	confirmedKeys   []string
+	reapedOlderThan time.Duration
+	reapCount       int
+	events          []OutboxEvent
 
 	gotProduct Product
 	renames    int
@@ -73,6 +77,16 @@ func (f *fakeRepo) Reserve(ctx context.Context, key string, items []ReserveItem)
 		})
 	}
 	return out, nil
+}
+
+func (f *fakeRepo) Confirm(_ context.Context, key string) error {
+	f.confirmedKeys = append(f.confirmedKeys, key)
+	return nil
+}
+
+func (f *fakeRepo) ReleaseExpired(_ context.Context, olderThan time.Duration) (int, error) {
+	f.reapedOlderThan = olderThan
+	return f.reapCount, nil
 }
 
 func (f *fakeRepo) Release(ctx context.Context, key string, items []ReserveItem) error {

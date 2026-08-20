@@ -4,6 +4,11 @@
 #   make docker-run     the whole stack
 #   make docker-down    stop it
 #
+# Signing keys: with JWT_PRIVATE_KEY and JWT_PUBLIC_KEY set (run `make keys`),
+# only the user service can issue a token and the rest can only check one. With
+# just JWT_SECRET, everything falls back to shared-secret HS256, which is what
+# the brief specifies and what a single service needs.
+#
 # Each service owns a separate MongoDB database on purpose. Sharing one and
 # agreeing not to read each other's collections works right up until somebody
 # does; separate databases make the boundary something the infrastructure
@@ -136,6 +141,18 @@ services:
       retries: 20
       start_period: 10s
 
+  # One-shot: writes the CA and key pairs into a shared volume before the
+  # services that need them start. Runs to completion and exits, which is what
+  # service_completed_successfully waits on.
+  certgen:
+    build:
+      context: .
+      args:
+        SERVICE: certgen
+    command: ["/certs"]
+    volumes:
+      - certs:/certs
+
   redis:
     image: redis:8-alpine
     restart: unless-stopped
@@ -205,6 +222,23 @@ services:
       # Quieter startup; the UI's own logs are not what anyone opened it for.
       LOGGING_LEVEL_ROOT: warn
 
+  # Trace collector and UI. Accepts OTLP directly, so there is no separate
+  # OpenTelemetry Collector in the way: the services speak OTLP/gRPC on 4317
+  # and the traces are readable at http://localhost:16686.
+  #
+  # all-in-one keeps traces in memory and loses them on restart, which is
+  # exactly right for development and exactly wrong for production — where the
+  # storage backend, sampling, and retention are the decisions that matter.
+  jaeger:
+    image: jaegertracing/all-in-one:1.68.0
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # the UI
+      - "4317:4317"     # OTLP/gRPC, where the services send spans
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      LOG_LEVEL: "warn"
+
   user:
     build:
       context: .
@@ -212,6 +246,8 @@ services:
         SERVICE: user
     restart: unless-stopped
     depends_on:
+      jaeger:
+        condition: service_started
       mongo-user:
         condition: service_healthy
     ports:
@@ -221,7 +257,17 @@ services:
     environment:
       MONGO_URI: "mongodb://mongo-user:27017/?replicaSet=rs-user"
       MONGO_DATABASE: "ecommerce"
-      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
+      JWT_SECRET: "${JWT_SECRET:-}"
+      JWT_PUBLIC_KEY: "${JWT_PUBLIC_KEY:-}"
+      # The private half lives here and nowhere else. No other service can mint
+      # a token, however compromised it becomes.
+      JWT_PRIVATE_KEY: "${JWT_PRIVATE_KEY:-}"
+      # Tracing. Unset this and the service still propagates a trace context it
+      # is handed; it simply exports nothing of its own.
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      # Everything, because this is a laptop. In production this is the first
+      # number to turn down, and the reason ParentBased sampling exists.
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
       LOG_LEVEL: "info"
 
   seller:
@@ -231,6 +277,8 @@ services:
         SERVICE: seller
     restart: unless-stopped
     depends_on:
+      jaeger:
+        condition: service_started
       mongo-seller:
         condition: service_healthy
       kafka:
@@ -244,9 +292,16 @@ services:
       # Same secret as the user service: it verifies tokens the user service
       # issued. In production this is where an asymmetric key pair earns its
       # keep — the issuer holds the private key and nobody else can mint tokens.
-      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
+      JWT_SECRET: "${JWT_SECRET:-}"
+      JWT_PUBLIC_KEY: "${JWT_PUBLIC_KEY:-}"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_GROUP_ID: "seller-service"
+      # Tracing. Unset this and the service still propagates a trace context it
+      # is handed; it simply exports nothing of its own.
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      # Everything, because this is a laptop. In production this is the first
+      # number to turn down, and the reason ParentBased sampling exists.
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
       LOG_LEVEL: "info"
 
   product:
@@ -255,7 +310,13 @@ services:
       args:
         SERVICE: product
     restart: unless-stopped
+    volumes:
+      - certs:/certs:ro
     depends_on:
+      jaeger:
+        condition: service_started
+      certgen:
+        condition: service_completed_successfully
       mongo-product:
         condition: service_healthy
       kafka:
@@ -268,13 +329,23 @@ services:
     environment:
       MONGO_URI: "mongodb://mongo-product:27017/?replicaSet=rs-product"
       MONGO_DATABASE: "ecommerce"
-      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
+      JWT_SECRET: "${JWT_SECRET:-}"
+      JWT_PUBLIC_KEY: "${JWT_PUBLIC_KEY:-}"
       KAFKA_BROKERS: "kafka:9092"
       # A group of its own: sharing one with the seller service would have them
       # stealing each other's messages.
       KAFKA_GROUP_ID: "product-service"
       REDIS_ADDR: "redis:6379"
       REDIS_TTL: "5m"
+      # Mutual TLS on the internal stock port. Without this the port would
+      # accept anything that can route a packet to it.
+      GRPC_TLS_DIR: "/certs"
+      # Tracing. Unset this and the service still propagates a trace context it
+      # is handed; it simply exports nothing of its own.
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      # Everything, because this is a laptop. In production this is the first
+      # number to turn down, and the reason ParentBased sampling exists.
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
       LOG_LEVEL: "info"
 
   order:
@@ -283,7 +354,13 @@ services:
       args:
         SERVICE: order
     restart: unless-stopped
+    volumes:
+      - certs:/certs:ro
     depends_on:
+      jaeger:
+        condition: service_started
+      certgen:
+        condition: service_completed_successfully
       mongo-order:
         condition: service_healthy
       kafka:
@@ -296,12 +373,20 @@ services:
     environment:
       MONGO_URI: "mongodb://mongo-order:27017/?replicaSet=rs-order"
       MONGO_DATABASE: "ecommerce"
-      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
+      JWT_SECRET: "${JWT_SECRET:-}"
+      JWT_PUBLIC_KEY: "${JWT_PUBLIC_KEY:-}"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_GROUP_ID: "order-service"
       # The one synchronous dependency in the system. Reachable inside the
       # network only: product publishes no gRPC port to the host.
       PRODUCT_GRPC_ADDR: "product:9090"
+      GRPC_TLS_DIR: "/certs"
+      # Tracing. Unset this and the service still propagates a trace context it
+      # is handed; it simply exports nothing of its own.
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      # Everything, because this is a laptop. In production this is the first
+      # number to turn down, and the reason ParentBased sampling exists.
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
       LOG_LEVEL: "info"
 
   marketplace:
@@ -311,6 +396,8 @@ services:
         SERVICE: marketplace
     restart: unless-stopped
     depends_on:
+      jaeger:
+        condition: service_started
       mongo-marketplace:
         condition: service_healthy
       kafka:
@@ -323,7 +410,8 @@ services:
     environment:
       MONGO_URI: "mongodb://mongo-marketplace:27017/?replicaSet=rs-marketplace"
       MONGO_DATABASE: "ecommerce"
-      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
+      JWT_SECRET: "${JWT_SECRET:-}"
+      JWT_PUBLIC_KEY: "${JWT_PUBLIC_KEY:-}"
       KAFKA_BROKERS: "kafka:9092"
       # Each stream gets its own group, derived from this prefix, so a backlog
       # on one cannot hold up the others.
@@ -332,6 +420,12 @@ services:
       # Short: search results have no key to invalidate by, so staleness is
       # bounded by time rather than removed.
       REDIS_TTL: "30s"
+      # Tracing. Unset this and the service still propagates a trace context it
+      # is handed; it simply exports nothing of its own.
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      # Everything, because this is a laptop. In production this is the first
+      # number to turn down, and the reason ParentBased sampling exists.
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
       LOG_LEVEL: "info"
 
   live:
@@ -341,6 +435,8 @@ services:
         SERVICE: live
     restart: unless-stopped
     depends_on:
+      jaeger:
+        condition: service_started
       mongo-live:
         condition: service_healthy
       kafka:
@@ -353,15 +449,23 @@ services:
     environment:
       MONGO_URI: "mongodb://mongo-live:27017/?replicaSet=rs-live"
       MONGO_DATABASE: "ecommerce"
-      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env or the environment}"
+      JWT_SECRET: "${JWT_SECRET:-}"
+      JWT_PUBLIC_KEY: "${JWT_PUBLIC_KEY:-}"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_GROUP_ID: "live"
       # Required, not optional: presence and broadcast are shared state. Two
       # instances without it would each have their own idea of the audience.
       REDIS_ADDR: "redis:6379"
+      # Tracing. Unset this and the service still propagates a trace context it
+      # is handed; it simply exports nothing of its own.
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      # Everything, because this is a laptop. In production this is the first
+      # number to turn down, and the reason ParentBased sampling exists.
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
       LOG_LEVEL: "info"
 
 volumes:
+  certs:
   mongo-user-data:
   mongo-seller-data:
   mongo-product-data:

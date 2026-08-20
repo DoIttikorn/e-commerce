@@ -20,6 +20,7 @@ import (
 type Service interface {
 	Reserve(ctx context.Context, key string, items []product.ReserveItem) ([]product.ReservedItem, error)
 	Release(ctx context.Context, key string, items []product.ReserveItem) error
+	Confirm(ctx context.Context, key string) error
 }
 
 // Server implements the generated StockServiceServer.
@@ -69,6 +70,18 @@ func (s *Server) Release(ctx context.Context, req *productv1.ReleaseRequest) (*p
 		return nil, mapError(err)
 	}
 	return &productv1.ReleaseResponse{ReleasedItems: int32(len(req.GetItems()))}, nil
+}
+
+// Confirm marks a reservation as belonging to an order that now exists.
+func (s *Server) Confirm(ctx context.Context, req *productv1.ConfirmRequest) (*productv1.ConfirmResponse, error) {
+	if req.GetIdempotencyKey() == "" {
+		return nil, status.Error(codes.InvalidArgument, "idempotency_key is required")
+	}
+
+	if err := s.svc.Confirm(ctx, req.GetIdempotencyKey()); err != nil {
+		return nil, mapError(err)
+	}
+	return &productv1.ConfirmResponse{}, nil
 }
 
 func toDomainItems(items []*productv1.StockItem) []product.ReserveItem {

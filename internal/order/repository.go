@@ -58,6 +58,15 @@ type StockReserver interface {
 	// Release gives stock back. It must be safe to call more than once,
 	// because compensation runs on the path where retries happen.
 	Release(ctx context.Context, key string, items []ReserveLine) error
+
+	// Confirm tells the stock owner the order exists.
+	//
+	// Until this is called, the reservation looks exactly like one whose caller
+	// died — and after a while the stock owner will treat it as such and take
+	// the stock back. That is deliberate: it is the only thing that can close
+	// the window between reserving and writing, because nothing in this service
+	// runs after it crashes.
+	Confirm(ctx context.Context, key string) error
 }
 
 // ReserveLine is what the Order domain asks for.

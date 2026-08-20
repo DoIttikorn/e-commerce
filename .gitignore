@@ -10,6 +10,10 @@
 # air live-reload workspace
 tmp/
 
+# Development certificates. Generated with `make certs`; never committed —
+# a private key in a repository is a private key that has been published.
+certs/
+
 # Test and coverage output
 *.out
 

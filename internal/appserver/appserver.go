@@ -36,6 +36,7 @@ import (
 	"github.com/DoIttikorn/e-commerce/internal/middleware"
 	"github.com/DoIttikorn/e-commerce/internal/router"
 	"github.com/DoIttikorn/e-commerce/internal/router/chirouter"
+	"github.com/DoIttikorn/e-commerce/internal/tracing"
 )
 
 const (
@@ -75,6 +76,18 @@ func New(ctx context.Context, name string) (*App, error) {
 	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
 
+	// Before anything else that might want to be traced. With no collector
+	// configured this installs a no-op provider and the W3C propagator, so the
+	// service still passes through a trace context it did not start.
+	flushTraces, err := tracing.Init(startupCtx, tracing.Config{
+		Endpoint:    cfg.Tracing.Endpoint,
+		ServiceName: name,
+		SampleRatio: cfg.Tracing.SampleRatio,
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	db, err := database.NewMongo(startupCtx, cfg.Mongo.URI, cfg.Mongo.Database)
 	if err != nil {
 		return nil, err
@@ -96,10 +109,12 @@ func New(ctx context.Context, name string) (*App, error) {
 		readyChecks: map[string]func(context.Context) error{},
 	}
 
-	// Order matters: RequestID first, so the metrics and log lines for one
-	// request carry the same correlation ID.
+	// Order matters: RequestID first, so the metrics, spans, and log lines for
+	// one request all carry the same correlation IDs. Tracing goes second so
+	// the trace ID is on the request context before anything logs.
 	app.Router.Use(
 		middleware.RequestID(),
+		middleware.Tracing(name),
 		middleware.NewMetrics(registry).Middleware(),
 		middleware.Logging(log),
 	)
@@ -111,6 +126,10 @@ func New(ctx context.Context, name string) (*App, error) {
 	})
 	app.OnShutdown(func(ctx context.Context) error { return db.Client().Disconnect(ctx) })
 
+	// Registered before Mongo's closer and therefore run after it: cleanups run
+	// in reverse, and a span recorded during shutdown should still be exported.
+	app.OnShutdown(flushTraces)
+
 	log.LogAttrs(ctx, slog.LevelInfo, "connected to mongo",
 		slog.String("database", cfg.Mongo.Database))
 
@@ -120,6 +139,7 @@ func New(ctx context.Context, name string) (*App, error) {
 	log.LogAttrs(ctx, slog.LevelInfo, "optional infrastructure",
 		slog.Bool("redis_configured", cfg.Redis.Enabled()),
 		slog.Bool("kafka_configured", cfg.Kafka.Enabled()),
+		slog.Bool("tracing_configured", cfg.Tracing.Enabled()),
 	)
 
 	return app, nil

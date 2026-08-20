@@ -278,17 +278,24 @@ cache whose hit rate nobody can see is a guess.
 
 Stated because they are real, in rough priority order:
 
-1. **No reaper for stranded reservations.** A crash between reserving stock and
-   writing the order holds stock against nothing until somebody notices.
-2. **No distributed tracing.** Request IDs correlate within a service; across
-   six of them, OpenTelemetry is the answer and is not here.
-3. **One JWT secret shared by every service.** The issuer should hold a private
-   key and the others only the public one.
-4. **The Product gRPC port has no service authentication.** It is unpublished
-   and in-network only; mutual TLS is the production answer.
-5. **Single-node replica sets and one Kafka partition per topic.** Both are
-   development conveniences: the first buys no redundancy, the second caps
-   consumer parallelism at one instance per group.
+1. **Single-node replica sets and a single Kafka broker.** The only remaining
+   item from the original list, and the only one that is a deployment decision
+   rather than code. Each service's MongoDB is a one-member set — enough for
+   transactions and change streams, no redundancy at all — and Kafka runs one
+   broker at `replicationFactor: 1`. The code is already written for more:
+   connection strings name replica sets, the driver is set to `majority` reads
+   and writes, and topics are created with three partitions.
+2. **No dead-letter topic.** A message a consumer cannot handle is retried
+   forever and blocks its partition behind it.
+3. **No rate limiting or circuit breaking.** The Order → Product call has a
+   five-second timeout but no breaker, so a Product service that is slow rather
+   than down is absorbed one checkout at a time.
+4. **Nothing watches the outbox depth.** `outbox.PendingCount` is the number to
+   alert on — a relay that has stopped looks exactly like an idle one until it
+   climbs — and no alert exists.
+
+Closed since the first version of this list: the reservation reaper,
+distributed tracing, per-service JWT keys, and mutual TLS on the stock port.
 
 ## Adding the next one
 

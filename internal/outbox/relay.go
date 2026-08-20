@@ -6,9 +6,17 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"github.com/DoIttikorn/e-commerce/internal/tracing"
 )
 
 // Defaults for the relay loop.
@@ -90,15 +98,44 @@ func (r *Relay) drainOne(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	if err := r.pub.PublishRaw(ctx, claimed.Topic, claimed.Key, []byte(claimed.PayloadJSON)); err != nil {
+	// Rejoin the trace of the request that produced this event. The span that
+	// wrote it has long since ended — this runs on a background loop — and
+	// parenting to an ended span is both legal and what every Kafka
+	// instrumentation does: the trace is the causal chain, not a call stack.
+	//
+	// The alternative, a span link, keeps the two traces separate and joined by
+	// a reference. That is the better shape when one message fans out from many
+	// producers; here each event has exactly one cause, and being able to open
+	// the checkout and see the event it published is the entire point.
+	publishCtx := otel.GetTextMapPropagator().Extract(ctx,
+		propagation.MapCarrier(claimed.TraceContext))
+
+	publishCtx, span := tracing.Tracer().Start(publishCtx, "outbox publish "+claimed.Topic,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination.name", claimed.Topic),
+			attribute.String("messaging.kafka.message.key", claimed.Key),
+			// How long the event sat in the outbox. The number that says
+			// whether the relay is keeping up, visible per event rather than
+			// only as a queue depth.
+			attribute.Int64("outbox.lag_ms", time.Since(claimed.CreatedAt).Milliseconds()),
+			attribute.Int("outbox.attempts", claimed.Attempts),
+		),
+	)
+	defer span.End()
+
+	if err := r.pub.PublishRaw(publishCtx, claimed.Topic, claimed.Key, []byte(claimed.PayloadJSON)); err != nil {
 		// Left claimed. The lease expires and it is tried again, which is the
 		// whole reason a broker being down is survivable rather than lossy.
+		span.SetStatus(codes.Error, err.Error())
 		return false, err
 	}
 
 	now := time.Now().UTC()
-	_, err = r.coll.UpdateByID(ctx, claimed.ID, bson.M{"$set": bson.M{"published_at": now}})
+	_, err = r.coll.UpdateByID(publishCtx, claimed.ID, bson.M{"$set": bson.M{"published_at": now}})
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		// Published but not marked: it will be sent again after the lease.
 		// That is the at-least-once edge, and it is why keys matter.
 		return true, err

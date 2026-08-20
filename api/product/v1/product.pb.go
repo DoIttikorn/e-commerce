@@ -356,6 +356,86 @@ func (x *ReleaseResponse) GetReleasedItems() int32 {
 	return 0
 }
 
+type ConfirmRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	IdempotencyKey string                 `protobuf:"bytes,1,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ConfirmRequest) Reset() {
+	*x = ConfirmRequest{}
+	mi := &file_api_product_v1_product_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfirmRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfirmRequest) ProtoMessage() {}
+
+func (x *ConfirmRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_product_v1_product_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfirmRequest.ProtoReflect.Descriptor instead.
+func (*ConfirmRequest) Descriptor() ([]byte, []int) {
+	return file_api_product_v1_product_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ConfirmRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+type ConfirmResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConfirmResponse) Reset() {
+	*x = ConfirmResponse{}
+	mi := &file_api_product_v1_product_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfirmResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfirmResponse) ProtoMessage() {}
+
+func (x *ConfirmResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_product_v1_product_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfirmResponse.ProtoReflect.Descriptor instead.
+func (*ConfirmResponse) Descriptor() ([]byte, []int) {
+	return file_api_product_v1_product_proto_rawDescGZIP(), []int{7}
+}
+
 var File_api_product_v1_product_proto protoreflect.FileDescriptor
 
 const file_api_product_v1_product_proto_rawDesc = "" +
@@ -383,10 +463,14 @@ const file_api_product_v1_product_proto_rawDesc = "" +
 	"\x05items\x18\x01 \x03(\v2\x15.product.v1.StockItemR\x05items\x12(\n" +
 	"\x0fidempotency_key\x18\xe8\a \x01(\tR\x0eidempotencyKey\"8\n" +
 	"\x0fReleaseResponse\x12%\n" +
-	"\x0ereleased_items\x18\x01 \x01(\x05R\rreleasedItems2\x96\x01\n" +
+	"\x0ereleased_items\x18\x01 \x01(\x05R\rreleasedItems\"9\n" +
+	"\x0eConfirmRequest\x12'\n" +
+	"\x0fidempotency_key\x18\x01 \x01(\tR\x0eidempotencyKey\"\x11\n" +
+	"\x0fConfirmResponse2\xda\x01\n" +
 	"\fStockService\x12B\n" +
 	"\aReserve\x12\x1a.product.v1.ReserveRequest\x1a\x1b.product.v1.ReserveResponse\x12B\n" +
-	"\aRelease\x12\x1a.product.v1.ReleaseRequest\x1a\x1b.product.v1.ReleaseResponseB;Z9github.com/DoIttikorn/e-commerce/api/product/v1;productv1b\x06proto3"
+	"\aRelease\x12\x1a.product.v1.ReleaseRequest\x1a\x1b.product.v1.ReleaseResponse\x12B\n" +
+	"\aConfirm\x12\x1a.product.v1.ConfirmRequest\x1a\x1b.product.v1.ConfirmResponseB;Z9github.com/DoIttikorn/e-commerce/api/product/v1;productv1b\x06proto3"
 
 var (
 	file_api_product_v1_product_proto_rawDescOnce sync.Once
@@ -400,7 +484,7 @@ func file_api_product_v1_product_proto_rawDescGZIP() []byte {
 	return file_api_product_v1_product_proto_rawDescData
 }
 
-var file_api_product_v1_product_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_api_product_v1_product_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_api_product_v1_product_proto_goTypes = []any{
 	(*StockItem)(nil),       // 0: product.v1.StockItem
 	(*ReserveRequest)(nil),  // 1: product.v1.ReserveRequest
@@ -408,6 +492,8 @@ var file_api_product_v1_product_proto_goTypes = []any{
 	(*ReserveResponse)(nil), // 3: product.v1.ReserveResponse
 	(*ReleaseRequest)(nil),  // 4: product.v1.ReleaseRequest
 	(*ReleaseResponse)(nil), // 5: product.v1.ReleaseResponse
+	(*ConfirmRequest)(nil),  // 6: product.v1.ConfirmRequest
+	(*ConfirmResponse)(nil), // 7: product.v1.ConfirmResponse
 }
 var file_api_product_v1_product_proto_depIdxs = []int32{
 	0, // 0: product.v1.ReserveRequest.items:type_name -> product.v1.StockItem
@@ -415,10 +501,12 @@ var file_api_product_v1_product_proto_depIdxs = []int32{
 	0, // 2: product.v1.ReleaseRequest.items:type_name -> product.v1.StockItem
 	1, // 3: product.v1.StockService.Reserve:input_type -> product.v1.ReserveRequest
 	4, // 4: product.v1.StockService.Release:input_type -> product.v1.ReleaseRequest
-	3, // 5: product.v1.StockService.Reserve:output_type -> product.v1.ReserveResponse
-	5, // 6: product.v1.StockService.Release:output_type -> product.v1.ReleaseResponse
-	5, // [5:7] is the sub-list for method output_type
-	3, // [3:5] is the sub-list for method input_type
+	6, // 5: product.v1.StockService.Confirm:input_type -> product.v1.ConfirmRequest
+	3, // 6: product.v1.StockService.Reserve:output_type -> product.v1.ReserveResponse
+	5, // 7: product.v1.StockService.Release:output_type -> product.v1.ReleaseResponse
+	7, // 8: product.v1.StockService.Confirm:output_type -> product.v1.ConfirmResponse
+	6, // [6:9] is the sub-list for method output_type
+	3, // [3:6] is the sub-list for method input_type
 	3, // [3:3] is the sub-list for extension type_name
 	3, // [3:3] is the sub-list for extension extendee
 	0, // [0:3] is the sub-list for field type_name
@@ -435,7 +523,7 @@ func file_api_product_v1_product_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_product_v1_product_proto_rawDesc), len(file_api_product_v1_product_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -223,6 +223,22 @@ func (r *Repository) Release(ctx context.Context, key string, items []product.Re
 	return nil
 }
 
+// Confirm changes no field this cache holds, so it passes straight through.
+func (r *Repository) Confirm(ctx context.Context, key string) error {
+	return r.inner.Confirm(ctx, key)
+}
+
+// ReleaseExpired puts stock back, which is a cached field.
+//
+// The affected product IDs are not known here — the inner repository looks them
+// up per reservation — so this relies on the TTL rather than pretending to
+// invalidate precisely. It runs rarely and on abandoned carts, so a cache entry
+// that is briefly short by a few units is the cheaper wrong answer than
+// scanning the keyspace for something to drop.
+func (r *Repository) ReleaseExpired(ctx context.Context, olderThan time.Duration) (int, error) {
+	return r.inner.ReleaseExpired(ctx, olderThan)
+}
+
 func productIDs(items []product.ReserveItem) []string {
 	ids := make([]string, 0, len(items))
 	for _, item := range items {

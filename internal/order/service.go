@@ -96,11 +96,13 @@ func NewService(repo Repository, stock StockReserver, log *slog.Logger) Service 
 //     under the caller's key.
 //  2. Write the order and its event together, in one local transaction.
 //  3. If step 2 fails, release the reservation.
+//  4. If step 2 succeeds, confirm the reservation.
 //
-// The window that remains is a crash between 1 and 2: the stock is taken and
-// no order exists to justify it. It is recovered by a reaper that releases
-// reservations with no matching order, which is not built here and is the
-// first thing this design needs before it carries real money.
+// Step 4 is what closes the window a saga cannot close by itself. A crash
+// between 1 and 2 leaves stock taken with no order, and no compensation in this
+// service can help, because this service is the thing that died. Confirming
+// makes the difference visible from the other side: the Product service
+// reclaims anything left unconfirmed for long enough.
 func (s *service) Place(ctx context.Context, in NewOrder) (Placement, error) {
 	if err := validatePlacement(in); err != nil {
 		return Placement{}, err
@@ -138,6 +140,18 @@ func (s *service) Place(ctx context.Context, in NewOrder) (Placement, error) {
 	if err != nil {
 		s.compensate(ctx, in.IdempotencyKey, in.Lines, err)
 		return Placement{}, err
+	}
+
+	// The order exists, so the reservation is no longer a candidate for the
+	// reaper. A failure here is logged, not returned: the order is real and
+	// the buyer should be told so. The worst case is the reaper reclaiming
+	// stock for an order that was placed — which is why the confirmation
+	// window is generous rather than tight.
+	if err := s.stock.Confirm(ctx, in.IdempotencyKey); err != nil {
+		s.log.LogAttrs(ctx, slog.LevelError, "confirming the reservation failed",
+			slog.String("order_id", saved.ID),
+			slog.String("idempotency_key", in.IdempotencyKey),
+			slog.String("error", err.Error()))
 	}
 
 	// Save resolves a lost race by returning the winner's order, so the ID

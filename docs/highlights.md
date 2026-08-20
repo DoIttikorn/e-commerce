@@ -130,6 +130,16 @@ Verified end to end by `TestTheOutboxRelayPublishesAndMarksSent`: place an
 order, subscribe a real consumer, run the relay, assert the event arrives and
 the row is marked sent so it is not published forever.
 
+The outbox is also where a distributed trace would otherwise end. The request
+that produced the event has returned by the time the relay runs, so its context
+is gone. `outbox.Append` therefore injects the ambient W3C trace context into
+the outbox row, and the relay extracts it before publishing — a producer span
+parented to the request that caused the event, seconds after that request
+finished, carrying `outbox.lag_ms` to say how long it waited. Parenting to a
+span that has already ended is deliberate: a trace is a causal chain, not a call
+stack. `TestTheOutboxCarriesTheTraceToThePublisher` is the proof, and it is the
+one test in the suite that would fail silently in production without saying so.
+
 ### Live Commerce keeps nothing in process memory
 
 A WebSocket lives on **exactly one instance**. Everything else follows:
@@ -147,6 +157,28 @@ A WebSocket lives on **exactly one instance**. Everything else follows:
 `TestABroadcastReachesASubscriberOnAnotherInstance` builds two buses on two
 connections — standing in for two instances — subscribes on one and publishes on
 the other. Anything less proves nothing.
+
+### Tracing that survives the parts nobody instruments
+
+*Details: [tech-stack.md](tech-stack.md#tracing)*
+
+Two decisions here were not the default one.
+
+**The HTTP middleware is hand-written instead of `otelhttp`.** The standard
+contrib middleware names a span when the span starts — before the router has
+matched — so the only name available is `r.URL.Path`, and
+`GET /api/v1/users/68f1…` per user is unbounded cardinality in the trace
+backend, where it costs indexing and money rather than a crash. The project
+already solved this for Prometheus labels: capture the matched pattern, and use
+it after the handler returns. A span can be renamed before `End`, so the same
+trick applies. gRPC needed none of it — a method name has no IDs in it — so
+`otelgrpc` is used unmodified there.
+
+**Tracing off still propagates.** With no collector configured the SDK is
+replaced by a no-op provider, but the propagator is installed regardless, so a
+trace context that arrives with a request is passed on rather than dropped. A
+service that swallows what it was handed does not merely fail to trace itself —
+it breaks the trace of everybody upstream and downstream of it.
 
 ### Two transports, on purpose
 
@@ -200,15 +232,27 @@ duplicate.
 
 ## What is missing
 
-In the order it should be fixed:
+The original four are done. A reaper reclaims reservations nobody confirmed;
+OpenTelemetry traces a request across all six services and through the outbox;
+the user service holds an Ed25519 private key and everything else only the
+public half; and the stock port requires a client certificate. Topics are
+created with three partitions.
 
-1. A reaper for reservations with no order.
-2. Distributed tracing. Request IDs correlate within a service; across six they
-   do not.
-3. Per-service credentials — one JWT secret is shared, and the Product gRPC port
-   has no service authentication beyond not being published.
-4. Multi-node replica sets and more than one partition per topic. Both are
-   development conveniences that cap availability and parallelism respectively.
+What is left, in the order it should be fixed:
+
+1. **Single-node replica sets and one Kafka broker.** The last item from the
+   original list, and the only one that is a deployment decision rather than
+   code. The URIs name replica sets, the driver is set to `majority` reads and
+   writes, and `KAFKA_PARTITIONS` is three — so adding members is compose and
+   an `rs.reconfig`, not a rewrite. On a laptop they are still single points of
+   failure.
+2. **No dead-letter topic.** A message a consumer cannot handle is retried
+   forever and blocks its partition behind it.
+3. **No rate limiting or circuit breaking.** The Order → Product call has a
+   timeout but no breaker, so a Product service that is slow rather than down
+   is absorbed one checkout at a time.
+4. **Nothing watches the outbox depth.** `outbox.PendingCount` is the number to
+   page on: a stopped relay looks exactly like an idle one until it climbs.
 
 [domains.md](domains.md) has the full map. [tech-stack.md](tech-stack.md) has why
 each technology is here and what it costs.

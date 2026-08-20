@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/DoIttikorn/e-commerce/internal/appserver"
@@ -22,6 +23,11 @@ import (
 
 	orderv1 "github.com/DoIttikorn/e-commerce/api/order/v1"
 )
+
+// productServerName is the name the Product service's certificate carries. It
+// is not necessarily the address dialled: a container reaches it at "product"
+// and a test at "127.0.0.1", and both should accept the same certificate.
+const productServerName = "product"
 
 func main() {
 	if err := run(); err != nil {
@@ -46,7 +52,7 @@ func run() error {
 		return errors.New("PRODUCT_GRPC_ADDR is required: an order cannot be placed without reserving stock")
 	}
 
-	if err := kafka.EnsureTopic(ctx, app.Cfg.Kafka.Brokers, orderv1.TopicOrderEvents, 1); err != nil {
+	if err := kafka.EnsureTopic(ctx, app.Cfg.Kafka.Brokers, orderv1.TopicOrderEvents, app.Cfg.Kafka.Partitions); err != nil {
 		return err
 	}
 
@@ -55,9 +61,15 @@ func run() error {
 
 	// Lazy: this returns before a connection exists and reconnects on its own,
 	// so a Product service that is slow to start does not stop this one.
-	stockClient, err := grpcstock.Dial(app.Cfg.ProductGRPCAddr)
+	stockClient, err := grpcstock.Dial(
+		app.Cfg.ProductGRPCAddr, app.Cfg.GRPCTLSDir, productServerName)
 	if err != nil {
 		return err
+	}
+	if app.Cfg.GRPCTLSDir == "" {
+		app.Log.LogAttrs(ctx, slog.LevelWarn,
+			"calling the stock service WITHOUT mutual TLS",
+			slog.String("fix", "set GRPC_TLS_DIR"))
 	}
 	app.OnShutdown(func(context.Context) error { return stockClient.Close() })
 
@@ -68,8 +80,14 @@ func run() error {
 
 	svc := order.NewService(repo, stockClient, app.Log)
 
-	tokens := auth.NewTokens(app.Cfg.JWTSecret, app.Cfg.JWTTTL)
-	orderhandler.New(svc, app.Log).Register(app.Router, auth.Middleware(tokens))
+	// Verify only. This service never issues a token, so it never needs a
+	// signing key — and with a key pair configured it could not sign one if it
+	// tried, which is the point of splitting them.
+	verifier, err := auth.NewVerifierFrom(app.Cfg.JWTSecret, app.Cfg.JWTPublicKey)
+	if err != nil {
+		return err
+	}
+	orderhandler.New(svc, app.Log).Register(app.Router, auth.Middleware(verifier))
 
 	// The relay is what turns rows in the outbox into messages on the broker.
 	// It runs in this process rather than as its own deployment because it is

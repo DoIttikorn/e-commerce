@@ -84,7 +84,7 @@ func run() error {
 	}
 
 	for _, sub := range subscriptions {
-		if err := kafka.EnsureTopic(ctx, app.Cfg.Kafka.Brokers, sub.topic, 1); err != nil {
+		if err := kafka.EnsureTopic(ctx, app.Cfg.Kafka.Brokers, sub.topic, app.Cfg.Kafka.Partitions); err != nil {
 			return err
 		}
 

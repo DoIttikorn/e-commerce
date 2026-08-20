@@ -56,6 +56,15 @@ load-read:
 load-auth:
 	@k6 run test/load/auth.js
 
+## keys: generate a JWT signing key pair for the asymmetric mode
+##       only the user service should ever hold JWT_PRIVATE_KEY
+keys:
+	@go run ./cmd/keygen
+
+## certs: generate development mTLS certificates into ./certs
+certs:
+	@go run ./cmd/certgen certs
+
 ## proto: regenerate gRPC code from the .proto contracts
 proto:
 	@echo "Generating protobuf..."
@@ -72,6 +81,11 @@ docker-run:
 kafka-ui:
 	@echo "http://localhost:8090 -> Topics -> seller.events -> Messages"
 	@open http://localhost:8090 2>/dev/null || echo "open http://localhost:8090"
+
+## traces: open the trace UI (the stack must be running)
+traces:
+	@echo "http://localhost:16686 -> Service: order -> Find Traces"
+	@open http://localhost:16686 2>/dev/null || echo "open http://localhost:16686"
 
 ## docker-logs: follow the logs — make docker-logs SERVICE=product
 docker-logs:
@@ -90,4 +104,4 @@ clean:
 	@echo "Cleaning..."
 	@rm -rf bin tmp
 
-.PHONY: help all build run watch lint test itest load-smoke load-read load-auth proto kafka-ui docker-run docker-logs docker-down docker-clean clean
+.PHONY: help all build run watch lint test itest load-smoke load-read load-auth keys certs proto kafka-ui traces docker-run docker-logs docker-down docker-clean clean

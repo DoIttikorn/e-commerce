@@ -8,8 +8,8 @@
 // The Product service's gRPC port is reachable only inside the cluster network
 // — compose exposes it without publishing it — and there is no per-user token
 // on these calls, because there is no user: one service is talking to another.
-// The production answer to that is mutual TLS or a service identity, and it is
-// not built here.
+// The answer to "which service is asking" is mutual TLS — see internal/servicetls
+// and the tlsDir argument to Dial.
 package grpcstock
 
 import (
@@ -25,6 +25,8 @@ import (
 
 	productv1 "github.com/DoIttikorn/e-commerce/api/product/v1"
 	"github.com/DoIttikorn/e-commerce/internal/order"
+	"github.com/DoIttikorn/e-commerce/internal/servicetls"
+	"github.com/DoIttikorn/e-commerce/internal/tracing"
 )
 
 // callTimeout bounds one reservation.
@@ -47,8 +49,27 @@ var _ order.StockReserver = (*Client)(nil)
 // grpc.NewClient is lazy: it returns before a connection exists and reconnects
 // on its own afterwards. That is wanted here — a Product service that is slow
 // to start must not stop the Order service from starting at all.
-func Dial(target string) (*Client, error) {
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+//
+// tlsDir empty means plaintext, which is what the test suite uses. With it set,
+// the connection presents a client certificate and verifies the server's, which
+// is how each side learns who the other actually is.
+func Dial(target, tlsDir, serverName string) (*Client, error) {
+	creds := insecure.NewCredentials()
+	if tlsDir != "" {
+		tlsCreds, err := servicetls.ClientCredentials(tlsDir, serverName)
+		if err != nil {
+			return nil, err
+		}
+		creds = tlsCreds
+	}
+
+	conn, err := grpc.NewClient(target,
+		grpc.WithTransportCredentials(creds),
+		// Injects the trace context into the call metadata, so the span the
+		// Product service opens hangs off the checkout that caused it rather
+		// than starting a trace of its own.
+		tracing.DialOption(),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("dial product service at %s: %w", target, err)
 	}
@@ -91,6 +112,16 @@ func (c *Client) Release(ctx context.Context, key string, items []order.ReserveL
 		Items:          toProtoItems(items),
 		IdempotencyKey: key,
 	}); err != nil {
+		return translate(err)
+	}
+	return nil
+}
+
+func (c *Client) Confirm(ctx context.Context, key string) error {
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+
+	if _, err := c.client.Confirm(ctx, &productv1.ConfirmRequest{IdempotencyKey: key}); err != nil {
 		return translate(err)
 	}
 	return nil

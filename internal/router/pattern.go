@@ -18,7 +18,17 @@ type pattern struct{ value string }
 
 // WithPatternCapture prepares r to receive its matched route pattern. Call it
 // from middleware that needs the pattern after the handler has run.
+//
+// Calling it twice returns r unchanged, and that is not an optimisation. More
+// than one middleware wants the pattern — tracing names its span with it,
+// metrics labels with it — and a second holder would shadow the first: SetPattern
+// finds the innermost one and fills that, leaving the outer middleware reading
+// an empty string it has no way to distinguish from a genuine miss. Whichever
+// registers first installs the holder; everyone reads the same one.
 func WithPatternCapture(r *http.Request) *http.Request {
+	if _, ok := r.Context().Value(patternKey{}).(*pattern); ok {
+		return r
+	}
 	return r.WithContext(context.WithValue(r.Context(), patternKey{}, &pattern{}))
 }
 

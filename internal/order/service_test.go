@@ -66,8 +66,15 @@ type fakeStock struct {
 	reserveFn func(context.Context, string, []ReserveLine) ([]ReservedLine, error)
 	releaseFn func(context.Context, string, []ReserveLine) error
 
-	reserveCalls int
-	releasedKeys []string
+	reserveCalls  int
+	releasedKeys  []string
+	confirmedKeys []string
+	confirmErr    error
+}
+
+func (f *fakeStock) Confirm(_ context.Context, key string) error {
+	f.confirmedKeys = append(f.confirmedKeys, key)
+	return f.confirmErr
 }
 
 func (f *fakeStock) Reserve(ctx context.Context, key string, items []ReserveLine) ([]ReservedLine, error) {
@@ -132,6 +139,42 @@ func TestPlaceSnapshotsPriceAndName(t *testing.T) {
 	// what lets it write them in one transaction.
 	if len(repo.savedEvents) != 1 {
 		t.Errorf("saved %d events with the order, want 1", len(repo.savedEvents))
+	}
+	// Confirming is what keeps the reaper from taking this stock back.
+	if len(stock.confirmedKeys) != 1 || stock.confirmedKeys[0] != "key-1" {
+		t.Errorf("confirmed %v, want the reservation confirmed once the order existed", stock.confirmedKeys)
+	}
+}
+
+// A reservation must not be confirmed for an order that was never written —
+// that would leave stock held with nothing to reclaim it.
+func TestAFailedOrderConfirmsNothing(t *testing.T) {
+	repo := &fakeRepo{saveFn: func(context.Context, Order, []OutboxEvent) (Order, error) {
+		return Order{}, errors.New("mongo unavailable")
+	}}
+	stock := &fakeStock{}
+
+	if _, err := newTestService(repo, stock).Place(context.Background(), validOrder()); err == nil {
+		t.Fatal("Place() error = nil, want the save failure")
+	}
+	if len(stock.confirmedKeys) != 0 {
+		t.Errorf("confirmed %v after a failed write, want nothing", stock.confirmedKeys)
+	}
+}
+
+// The order is real even if the confirmation call fails; the buyer is told so.
+// The cost is that the reaper may reclaim the stock later, which is why the
+// grace period is generous rather than tight.
+func TestPlaceSucceedsEvenIfConfirmingFails(t *testing.T) {
+	stock := &fakeStock{confirmErr: errors.New("product service unreachable")}
+
+	placed, err := newTestService(&fakeRepo{}, stock).Place(context.Background(), validOrder())
+
+	if err != nil {
+		t.Fatalf("Place() error = %v, want the order to be reported as placed", err)
+	}
+	if placed.Order.ID == "" {
+		t.Error("no order came back")
 	}
 }
 

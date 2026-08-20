@@ -54,6 +54,16 @@ type Service interface {
 	// order ID, so a retried call takes stock once.
 	Reserve(ctx context.Context, key string, items []ReserveItem) ([]ReservedItem, error)
 
+	// Confirm marks a reservation as belonging to a real order, so the reaper
+	// leaves it alone. Callers must do this once the order is written.
+	Confirm(ctx context.Context, key string) error
+
+	// ReleaseExpired puts back stock held by reservations nobody confirmed.
+	// It is the reaper, and it is what closes the crash window in the caller's
+	// saga — a window no logic in the caller can close, because the caller is
+	// the thing that died.
+	ReleaseExpired(ctx context.Context, olderThan time.Duration) (int, error)
+
 	// Release is the compensating action for a reservation being undone. It is
 	// safe to call more than once.
 	Release(ctx context.Context, key string, items []ReserveItem) error
@@ -288,6 +298,26 @@ func (s *service) Reserve(ctx context.Context, key string, items []ReserveItem) 
 // Release returns reserved stock.
 func (s *service) Release(ctx context.Context, key string, items []ReserveItem) error {
 	return s.repo.Release(ctx, key, items)
+}
+
+// Confirm marks a reservation as accounted for.
+func (s *service) Confirm(ctx context.Context, key string) error {
+	return s.repo.Confirm(ctx, key)
+}
+
+// ReleaseExpired reclaims stock nobody ever claimed properly.
+func (s *service) ReleaseExpired(ctx context.Context, olderThan time.Duration) (int, error) {
+	released, err := s.repo.ReleaseExpired(ctx, olderThan)
+	if err != nil {
+		return 0, err
+	}
+	if released > 0 {
+		// Worth logging loudly. A steady trickle is abandoned checkouts; a
+		// sudden spike means callers are crashing after reserving.
+		s.log.LogAttrs(ctx, slog.LevelWarn, "released stock from unconfirmed reservations",
+			slog.Int("reservations", released))
+	}
+	return released, nil
 }
 
 // AuthorizeOwner reports whether the account owns the shop a product sits in.

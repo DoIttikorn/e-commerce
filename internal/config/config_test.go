@@ -14,12 +14,13 @@ import (
 // both export MONGO_URI and MONGO_DATABASE, and a test that quietly inherits
 // them passes locally and fails in the pipeline.
 var configEnv = []string{
-	"HTTP_ADDR", "GRPC_ADDR", "ADMIN_ADDR", "PRODUCT_GRPC_ADDR",
+	"HTTP_ADDR", "GRPC_ADDR", "ADMIN_ADDR", "PRODUCT_GRPC_ADDR", "GRPC_TLS_DIR",
 	"MONGO_URI", "MONGO_DATABASE",
-	"JWT_SECRET", "JWT_TTL",
+	"JWT_SECRET", "JWT_PRIVATE_KEY", "JWT_PUBLIC_KEY", "JWT_TTL",
 	"SHUTDOWN_TIMEOUT", "LOG_LEVEL",
 	"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "REDIS_TTL",
-	"KAFKA_BROKERS", "KAFKA_GROUP_ID",
+	"KAFKA_BROKERS", "KAFKA_GROUP_ID", "KAFKA_PARTITIONS",
+	"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_TRACES_SAMPLER_ARG",
 }
 
 // clearEnv unsets everything for the duration of the test. t.Setenv restores
@@ -193,5 +194,71 @@ func TestLoadReportsAllProblemsTogether(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error = %q, want it to mention %q", err, want)
 		}
+	}
+}
+
+// Tracing off is a valid configuration, not a missing one.
+func TestTracingIsOffWithoutACollector(t *testing.T) {
+	validEnv(t)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Tracing.Enabled() {
+		t.Error("tracing reported enabled with no OTEL_EXPORTER_OTLP_ENDPOINT")
+	}
+	if cfg.Tracing.SampleRatio != 1 {
+		t.Errorf("sample ratio = %v, want 1", cfg.Tracing.SampleRatio)
+	}
+}
+
+// A ratio outside 0..1 is a typo. Reporting it beats sampling everything
+// because somebody wrote 50 meaning 50%.
+func TestLoadRejectsAnOutOfRangeSampleRatio(t *testing.T) {
+	validEnv(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-collector:4317")
+	t.Setenv("OTEL_TRACES_SAMPLER_ARG", "50")
+
+	_, err := config.Load()
+
+	if err == nil {
+		t.Fatal("Load() accepted a sample ratio of 50")
+	}
+	if !strings.Contains(err.Error(), "OTEL_TRACES_SAMPLER_ARG") {
+		t.Errorf("error = %v, want it to name the variable", err)
+	}
+}
+
+// Every service except the issuer runs on the public key alone. Rejecting that
+// as "half a pair" makes asymmetric mode impossible to deploy — which is what
+// it did, until the compose stack was actually started in that mode.
+func TestAPublicKeyAloneIsAValidConfiguration(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("MONGO_URI", "mongodb://localhost:27017")
+	t.Setenv("JWT_PUBLIC_KEY", "cHVibGljLWtleQ==")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() rejected a verify-only service: %v", err)
+	}
+	if cfg.JWTPrivateKey != "" {
+		t.Error("a private key appeared from nowhere")
+	}
+}
+
+// The other direction really is invalid: the issuer needs both halves.
+func TestAPrivateKeyAloneIsRejected(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("MONGO_URI", "mongodb://localhost:27017")
+	t.Setenv("JWT_PRIVATE_KEY", "cHJpdmF0ZS1rZXk=")
+
+	_, err := config.Load()
+
+	if err == nil {
+		t.Fatal("Load() accepted a private key with no public key")
+	}
+	if !strings.Contains(err.Error(), "JWT_PUBLIC_KEY") {
+		t.Errorf("error = %v, want it to name the missing variable", err)
 	}
 }

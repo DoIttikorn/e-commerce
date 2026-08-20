@@ -466,8 +466,28 @@ be broken:
 - **Correlation happens in the slog handler**, not at call sites: log with the
   request context and the `request_id` is added automatically. Never thread a
   logger through function arguments to achieve this.
-- Middleware order is `RequestID` → `Metrics` → `Logging`. RequestID must be
-  first or the other two record uncorrelated lines.
+- **Span names are route patterns too**, for the same cardinality reason. This
+  is why `internal/middleware/tracing.go` is hand-written instead of `otelhttp`:
+  the contrib middleware names the span before the router has matched, leaving
+  it nothing but `r.URL.Path`. The span is renamed after `next.ServeHTTP`, which
+  the OTel API permits before `End`. gRPC needs none of this — a method name has
+  no IDs in it — so `otelgrpc` is used as-is via `tracing.ServerOption()` and
+  `tracing.DialOption()`.
+- **The propagator is installed even with tracing disabled.** No collector means
+  a no-op provider and nothing exported, but a trace context that arrives with a
+  request must still be passed on. A service that drops it puts a hole in
+  somebody else's trace.
+- **Async hops carry the trace explicitly.** `outbox.Append` injects the ambient
+  trace context into the outbox row and the relay extracts it before publishing,
+  so an event published a second after the request returned still belongs to
+  that request. Kafka carries it in message headers, never in the payload — the
+  payload is the domain's contract.
+- **Sampling is `ParentBased`.** The decision is made once at the root and
+  honoured downstream. Per-service sampling produces traces with missing middles.
+- Only 5xx marks a span as an error. A 404 or a 422 is the server working.
+- Middleware order is `RequestID` → `Tracing` → `Metrics` → `Logging`. RequestID
+  must be first or the rest record uncorrelated lines, and Tracing must precede
+  Logging so `trace_id` is on the context before anything logs.
 
 ## HTTP API contract
 
@@ -654,9 +674,18 @@ Deliberately few. Config parsing, JSON, HTTP, and logging need no third party.
 - `github.com/prometheus/client_golang` — metrics. Collectors are registered on
   an explicit `prometheus.NewRegistry()` built in `main`, never the package-level
   default, so there is no global state and tests can use a throwaway registry.
-
-To be added with the domain: a JWT library, `golang.org/x/crypto/bcrypt` (already
-an indirect dependency), and `google.golang.org/grpc`.
+- `github.com/redis/go-redis/v9` — caching, search cache, presence. Always
+  optional: a domain using it must run without it.
+- `github.com/segmentio/kafka-go` — events. Reachable only from `internal/kafka`.
+- `github.com/golang-jwt/jwt/v5` — tokens. Verification pins the algorithm with
+  `WithValidMethods`; without that, a token signed with the *public* key as an
+  HMAC secret verifies.
+- `golang.org/x/crypto/bcrypt` — password hashing.
+- `google.golang.org/grpc` — internal RPC.
+- `github.com/coder/websocket` — live commerce. `gorilla/websocket` is archived.
+- `go.opentelemetry.io/otel` + `sdk` + the OTLP exporter + `otelgrpc` — tracing.
+  The API (`otel/trace`) is imported by `internal/logging`; the SDK is imported
+  only by `internal/tracing`, so nothing else can install a provider.
 
 ## Local tooling
 
@@ -666,12 +695,13 @@ Not installed — install on demand: `protoc` + `protoc-gen-go` + `protoc-gen-go
 
 ## Next steps
 
-The User domain is complete: design artefacts, entity, service, port, all three
-adapters, `internal/auth`, and tests at every level. What remains:
+Six domains are built — User, Seller, Product, Order, Marketplace, Live Commerce
+— each with a separate MongoDB instance, plus the transactional outbox, mutual
+TLS on the internal gRPC link, asymmetric JWT, and OpenTelemetry tracing across
+all of it. `README.md` is written and verified end to end. What remains:
 
-1. `README.md` — a graded deliverable: setup, the JWT guide, sample requests
-   (link `test/http/api.http` and `test/grpc/requests.md`), and the documented
-   decisions, including the authorization model.
-2. `docs/lottery-search-design.md` — see `NOTES.local.md` for why this carries
+1. `docs/lottery-search-design.md` — see `NOTES.local.md` for why this carries
    more weight than its "no code required" framing suggests.
-3. Only then: the next e-commerce domain.
+2. The gaps listed in [docs/highlights.md](docs/highlights.md): multi-node
+   replica sets, a dead-letter topic, rate limiting and circuit breaking, and an
+   alert on outbox depth.
