@@ -45,6 +45,11 @@ type Redis struct {
 	Addr     string
 	Password string
 	DB       int
+
+	// TTL bounds how long a cached entry may be stale. It is a ceiling, not the
+	// mechanism: writes invalidate their own keys, and this only catches the
+	// entries a missed invalidation would otherwise strand forever.
+	TTL time.Duration
 }
 
 // Enabled reports whether a Redis endpoint was configured.
@@ -86,6 +91,7 @@ func Load() (Config, error) {
 			Addr:     os.Getenv("REDIS_ADDR"),
 			Password: os.Getenv("REDIS_PASSWORD"),
 			DB:       l.integer("REDIS_DB", 0),
+			TTL:      l.duration("REDIS_TTL", 5*time.Minute),
 		},
 		Kafka: Kafka{
 			Brokers: l.list("KAFKA_BROKERS"),

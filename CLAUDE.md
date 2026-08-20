@@ -4,8 +4,12 @@ Guidance for Claude Code when working in this repository.
 
 ## Project
 
-An e-commerce backend in Go, built as a set of domain services behind REST and
-gRPC.
+An e-commerce backend in Go: one binary per domain, sharing a repository.
+
+Three services exist — `user`, `seller`, `product` — each independently
+deployable, each owning its own MongoDB database. They do not call each other
+and do not read each other's collections; the only line between them is a Kafka
+event stream. [docs/domains.md](docs/domains.md) is the map.
 
 - Module path: `github.com/DoIttikorn/e-commerce`
 - Go: 1.26.x (1.26.6 installed locally)
@@ -31,7 +35,7 @@ Local-only, not committed (see `.gitignore`):
 
 ## Current state
 
-**The User domain is built, wired, and verified end to end. No other domain exists.**
+**Three domains are built, wired, and verified end to end: User, Seller, Product.**
 
 In place and passing `make lint` and `make test`:
 
@@ -43,12 +47,18 @@ In place and passing `make lint` and `make test`:
 - `internal/logging` — JSON logger that stamps the request ID on every record
 - `internal/middleware` — request ID, Prometheus RED metrics, request logging
 - `internal/admin` — metrics and pprof on their own port
-- `cmd/api/main.go` — wiring, `/healthz` + `/readyz`, graceful shutdown of both servers
+- `internal/appserver` — the bootstrap every service shares: config, logging,
+  Mongo, metrics, `/healthz` + `/readyz`, background tasks, graceful shutdown
+- `internal/kafka` — publisher, consumer, idempotent topic creation
+- `cmd/user`, `cmd/seller`, `cmd/product` — one thin main per service
 - `Makefile`, `Dockerfile`, `docker-compose.yml`, `.github/workflows/ci.yml`,
   `.air.toml`, `.env.example`, `.gitignore`, `.dockerignore`
 - `internal/user` — entity, service, `Repository` port, `mongodb` driven adapter,
   `handler` (REST) and `gapi` (gRPC) driving adapters, and the ten-second
   `CountLogger`
+- `internal/seller` — shops; publishes `seller.registered` and `seller.updated`
+- `internal/product` — listings; consumes seller events into a local read model,
+  and caches reads through a `rediscache` decorator over the `Repository` port
 - `internal/auth` — bcrypt hashing, HS256 issue/verify, bearer middleware
 - `api/user/v1` — `user.proto` plus generated, committed Go code
 - `test/integration` — repository tests against a real MongoDB (including the
@@ -56,8 +66,8 @@ In place and passing `make lint` and `make test`:
 - `test/http/api.http`, `test/grpc/requests.md` — request collections for both
   protocols, doubling as the brief's sample requests deliverable
 
-Not written yet: `README.md`, `docs/lottery-search-design.md`, and every other
-domain.
+Not written yet: `README.md`, `docs/lottery-search-design.md`, and the Order,
+Marketplace and Live Commerce domains.
 
 ### Design before domain
 
@@ -116,16 +126,22 @@ Not used: `/vendor`, `/init`, `/third_party`, `/website`, `/examples`, `/assets`
 
 ```
 .
-├── api/
-│   └── user/v1/                     # one directory per domain contract
-│       ├── user.proto
-│       └── user.pb.go               # generated, committed
-├── cmd/
-│   └── api/main.go                  # wiring, starts HTTP + gRPC, graceful shutdown
+├── api/                             # published contracts: proto and events
+│   ├── user/v1/
+│   │   ├── user.proto
+│   │   └── user.pb.go               # generated, committed
+│   └── seller/v1/events.go          # the event envelope consumers import
+├── cmd/                             # one directory per service binary
+│   ├── user/main.go
+│   ├── seller/main.go
+│   └── product/main.go              # wiring only; appserver has the rest
 ├── internal/
+│   ├── appserver/                   # shared bootstrap for every service
+│   ├── kafka/                       # publisher, consumer, topic creation
 │   ├── config/                      # env-based config
 │   ├── database/                    # shared driver init
-│   │   └── mongo.go                 # client construction + reachability ping
+│   │   ├── mongo.go                 # client construction + reachability ping
+│   │   └── redis.go
 │   ├── logging/                     # logger + request-ID correlation
 │   ├── admin/                       # metrics + pprof, separate port
 │   ├── middleware/                  # stdlib-shaped HTTP middleware
@@ -137,14 +153,18 @@ Not used: `/vendor`, `/init`, `/third_party`, `/website`, `/examples`, `/assets`
 │   │   ├── pattern.go               # matched-route capture, for metrics labels
 │   │   └── chirouter/               # chi adapter
 │   ├── auth/                        # JWT issue/verify, password hashing, middleware
-│   └── user/                        # first domain — the template for the rest
-│       ├── user.go                  # entity + domain errors
-│       ├── service.go               # business logic
-│       ├── service_test.go          # unit tests with fakes
-│       ├── repository.go            # PORT: Repository interface only
-│       ├── mongodb/                 # DRIVEN adapter
-│       ├── handler/                 # DRIVING adapter: REST
-│       └── gapi/                    # DRIVING adapter: gRPC (CreateUser, GetUser)
+│   ├── user/                        # the template every domain copies
+│   │   ├── user.go                  # entity + domain errors
+│   │   ├── service.go               # business logic
+│   │   ├── service_test.go          # unit tests with fakes
+│   │   ├── repository.go            # PORT: Repository interface only
+│   │   ├── mongodb/                 # DRIVEN adapter
+│   │   ├── handler/                 # DRIVING adapter: REST
+│   │   └── gapi/                    # DRIVING adapter: gRPC (CreateUser, GetUser)
+│   ├── seller/                      # same shape; publishes events
+│   └── product/                     # same shape, plus:
+│       ├── rediscache/              # DRIVEN adapter: cache over Repository
+│       └── events/                  # DRIVEN adapter: fed by seller events
 ├── test/{integration,testdata}/
 ├── docs/
 ├── Makefile
@@ -191,17 +211,66 @@ A domain gets `gapi/` only when something actually calls it over gRPC, and
 
 ### Crossing domains
 
-This matters more with every domain added:
+Now that domains are separate processes with separate databases, these are not
+style preferences — breaking one makes the services impossible to deploy apart.
 
-- A domain never imports another domain's `mongodb`, `handler`, or `gapi` package.
-- Cross-domain calls go through a **service interface declared by the caller**.
-  If `order` needs users, `order` declares the narrow interface it needs
-  (`type UserLookup interface { ByID(ctx, id) (User, error) }`) and `main` wires
-  `user.Service` into it.
-- Do not share entities between domains. If `order` needs a customer name, it
-  defines its own small type. Shared entities couple domains together and are the
-  usual reason a "microservice" layout cannot actually be split.
-- No domain reads another domain's collections.
+- A domain never imports another domain's `mongodb`, `handler`, `gapi`, or
+  service package. The only thing it may import from another domain is that
+  domain's contract under `api/`.
+- **No domain reads another domain's collections or database.** Compose gives
+  each service its own database so this is enforced rather than agreed.
+- **Do not share entities.** `product.SellerRef` is Product's own small type, not
+  `seller.Seller`. A shared entity couples the two together and is the usual
+  reason a "microservice" layout cannot actually be split.
+- **Prefer an event to a call.** When a domain needs facts from another, it
+  subscribes to that domain's events and keeps a local read model, as
+  `internal/product` does with `seller_directory`. A synchronous call puts the
+  other service's availability and latency on your request path.
+- A synchronous call is still right when the caller needs an answer that cannot
+  be stale — an authorization decision, or a balance. Then declare a narrow
+  interface at the **caller** and wire the client in `main`.
+
+### Events
+
+Rules that come from things that have already bitten:
+
+- **One topic per publishing domain** (`seller.events`), with a `Type` field in
+  the envelope — not a topic per event type. Consumers decode the whole topic
+  and ignore what does not apply, so a publisher can add an event type without
+  coordinating with anybody.
+- **Key by the entity the event is about.** Ordering is per partition, so two
+  events about one seller must share a key or they can be applied backwards.
+- **Handlers must be idempotent.** Delivery is at-least-once and the commit
+  happens after the handler succeeds, so a repeat is certain, not possible.
+- **Commit after handling, never before.** `internal/kafka` uses
+  `FetchMessage` + `CommitMessages` for exactly this.
+- **A permanently undecodable message returns nil**, not an error. Retrying it
+  forever blocks its partition for every message behind it. Log it; a production
+  deployment sends it to a dead-letter topic.
+- **Create topics at startup** with `kafka.EnsureTopic` rather than relying on
+  auto-creation. A consumer that subscribes before the first publish otherwise
+  races topic creation and sits idle.
+- **Publishing happens after the write and cannot fail it.** The write is already
+  committed, so a publish error is logged, not returned. This loses the event —
+  the fix is a transactional outbox, and it is the first thing to add when this
+  stops being a demonstration.
+
+### Caching
+
+- **A cache is a decorator over the `Repository` port**, never a branch inside a
+  service. `internal/product/rediscache` implements `product.Repository`, so the
+  service is written as though no cache exists and removing it is one line.
+- **Redis failures fall through to the database.** A cache that fails the request
+  when it is unavailable has become a dependency and made availability worse.
+- **Redis is a readiness check, never a liveness one.**
+- **Writes invalidate; they do not rewrite.** Rewriting lets two racing writers
+  leave the older value cached indefinitely.
+- **Invalidate exactly, never by scanning.** `RenameSeller` returns the affected
+  IDs so the decorator can delete those keys; scanning Redis for keys that might
+  match is `O(keyspace)`.
+- **Do not cache paged lists.** Every filter and page is a separate key and every
+  write would have to invalidate an unknown number of them.
+- **Every cache exports a hit/miss counter.** A hit rate nobody can see is a guess.
 
 ## The router abstraction
 
@@ -381,26 +450,51 @@ Conventions:
 ## Commands
 
 ```bash
-make run          # go run ./cmd/api
-make build
-make watch        # live reload via air
-make lint         # gofmt check + go vet, same as CI
-make test         # unit tests only: go test -short -race -v ./...
-make itest        # everything including integration: needs MongoDB running
-make proto        # protoc generation into api/<domain>/v1/
-make docker-run       # api + mongo
-make docker-run-full  # api + mongo + redis + kafka
-make docker-down
-make clean
+make                        # list every target
+make run                    # go run ./cmd/user
+make run SERVICE=product    # or any other service
+make watch SERVICE=seller   # live reload one service
+make build                  # every binary into ./bin
+
+make lint                   # gofmt + vet, exactly what CI runs
+make test                   # unit tests only, no infrastructure needed
+make itest                  # every test, needs MongoDB + Redis + Kafka
+
+make proto                  # regenerate api/user/v1 from the .proto
+
+make load-smoke             # k6 sanity check, 1 user
+make load-read              # k6 load on the cached catalogue read
+make load-auth              # k6 load on login
+
+make docker-run             # build and start all six containers
+make docker-logs SERVICE=product
+make docker-down            # stop, keeping data volumes
+make docker-clean           # stop and delete the volumes too
 ```
 
+`SERVICE` defaults to `user` and accepts `user`, `seller`, or `product`.
+
+`docker-run` passes `--remove-orphans`, which matters after a service is renamed
+in `docker-compose.yml`: the old container keeps its published ports and the new
+one fails to bind.
+
 `make test` passes `-short`, so integration tests must guard on
-`testing.Short()` to stay out of it. `make itest` drops the flag. CI runs both as
-separate jobs, plus a Docker image build.
+`testing.Short()` to stay out of it. `make itest` drops the flag and expects
+MongoDB, Redis and Kafka to be reachable; with the compose stack up it needs no
+environment variables, because the integration tests default to `127.0.0.1`.
+
+CI runs both as separate jobs, plus an image build per service.
 
 ## Testing
 
 - Go's standard `testing` package. No mocking framework; hand-write fakes.
+- **Load tests live in `test/load/`** and run with k6 against a live stack.
+  [test/load/README.md](test/load/README.md) carries the measured numbers,
+  including the one worth knowing: the Redis cache moves throughput by 3% and
+  takes MongoDB from 685,062 reads to 4. Add a cache to protect a dependency,
+  not to lower latency — and measure which one you are protecting.
+- Load-test thresholds are **regression alarms, not targets**: `p(95)<150` on a
+  path that runs at 7.56 ms exists so a tenfold slowdown fails the build.
 - **`service_test.go`** sits next to `service.go` and uses a fake `Repository`
   defined in the test file. This is the payoff of the port interface: the whole
   business-logic suite runs with no database and no HTTP.
@@ -455,20 +549,16 @@ A design document only — **do not write implementation code for it.** It goes 
 
 ## E-commerce roadmap
 
-Domains to come, once the User domain and the design document are done:
-Seller, Product, Order, Cart, Payment, Marketplace, Live Commerce.
+Built: User, Seller, Product. To come, in dependency order: **Order**,
+Marketplace, Live Commerce. [docs/domains.md](docs/domains.md) has the map and
+the reasoning.
 
 Each arrives as a full domain package per [Adding a domain](#adding-a-domain).
 
-Redis and Kafka are **configured but not wired**: `internal/config` reads their
-settings and `docker-compose.yml` can run them, but no Go client exists and no
-dependency has been added. Add the client when a domain actually needs caching,
-distributed locking, or events — not before. A dependency with no caller is worse
-than no dependency, and the config being ready means adding one later costs a
-constructor, not a refactor.
-
-Per the house convention, the Redis client belongs in `internal/database/redis.go`
-and the Kafka client in `internal/kafka/`.
+Redis and Kafka are wired, in `internal/database/redis.go` and `internal/kafka/`
+per the house convention. Both remain optional to the platform: a service that
+genuinely needs one says so at startup rather than failing on first use, which
+is what `cmd/seller` and `cmd/product` do with `KAFKA_BROKERS`.
 
 **Blocker to clear before Order:** MongoDB multi-document transactions require a
 replica set, and `docker-compose.yml` runs a single standalone node. Writing an
