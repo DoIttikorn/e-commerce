@@ -1,8 +1,11 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -156,5 +159,74 @@ func TestMutualTLSRejectsAMismatchedServerName(t *testing.T) {
 
 	if _, err := client.Reserve(ctx, "mtls-badname", oneLine(fix.item.ID, 1)); err == nil {
 		t.Fatal("a server whose certificate does not name it was accepted")
+	}
+}
+
+// Re-running the generator must not invalidate the certificates already in use.
+//
+// A new CA invalidates everything the old one signed. When certgen ran on every
+// `docker compose up`, a partial restart left the Order service trusting an
+// authority that no longer existed, and every stock reservation failed with
+// "certificate signed by unknown authority" — with both containers healthy and
+// nothing in either log to suggest a certificate problem until the handshake.
+func TestGeneratingTwiceLeavesTheCertificatesAlone(t *testing.T) {
+	dir := certDir(t)
+
+	first, err := os.ReadFile(filepath.Join(dir, "ca.pem"))
+	if err != nil {
+		t.Fatalf("read ca: %v", err)
+	}
+
+	if err := servicetls.Generate(dir); err != nil {
+		t.Fatalf("second Generate() error = %v", err)
+	}
+
+	second, err := os.ReadFile(filepath.Join(dir, "ca.pem"))
+	if err != nil {
+		t.Fatalf("read ca: %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatal("the second run replaced the CA, invalidating every certificate it had signed")
+	}
+}
+
+// A client that trusts the first CA must still be able to call a server that
+// started after the generator ran again. This is the failure as it was actually
+// seen, rather than a comparison of file contents.
+func TestAClientKeepsWorkingAcrossASecondGenerate(t *testing.T) {
+	dir := certDir(t)
+	fix, ctx := startStockServer(t, dir)
+
+	client, err := grpcstock.Dial(fix.addr, dir, "localhost")
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	// Stands in for the init container running again on the next compose up.
+	if err := servicetls.Generate(dir); err != nil {
+		t.Fatalf("second Generate() error = %v", err)
+	}
+
+	if _, err := client.Reserve(ctx, "mtls-regen", oneLine(fix.item.ID, 1)); err != nil {
+		t.Fatalf("Reserve() after regeneration error = %v", err)
+	}
+}
+
+// An incomplete set is replaced rather than trusted: half a set is not a set.
+func TestAMissingFileCausesAFullRegeneration(t *testing.T) {
+	dir := certDir(t)
+
+	if err := os.Remove(filepath.Join(dir, "client-key.pem")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := servicetls.Generate(dir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	for _, name := range []string{"ca.pem", "server.pem", "server-key.pem", "client.pem", "client-key.pem"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s missing after regeneration: %v", name, err)
+		}
 	}
 }

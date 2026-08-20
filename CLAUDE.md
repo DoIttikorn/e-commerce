@@ -268,6 +268,10 @@ Rules that come from things that have already bitten:
 - **Consumer lag is the metric that matters.** `make kafka-ui` shows it per
   group; a lag that climbs means the consumer is losing to the producer, and
   every health check will still be green.
+- **A publisher's `BatchTimeout` must be small.** kafka-go defaults to one
+  second, and the outbox relay publishes one event at a time — so the default
+  put a full second on every event and capped the relay at roughly one event per
+  second. Nothing but a trace showed it.
 - **Never publish from a request path.** Events are written into the same
   transaction as the change that produced them, and a relay publishes them
   afterwards. A service that publishes directly can succeed at the write and
@@ -646,6 +650,16 @@ run identically, only slower. In `live` it is **required**, because presence and
 broadcast are shared state rather than a cache: two instances without it would
 each have their own idea of the audience and both would be wrong.
 
+`docker-compose.ha.yml` is an opt-in overlay giving Product a **three-member**
+set. It exists to prove the claim that multi-node needs no code change — kill
+the primary and the service keeps serving — and it is opt-in because eighteen
+mongod processes is the wrong default for a laptop. `make docker-run-ha`.
+
+**Certificate generation must stay idempotent.** `servicetls.Generate` leaves an
+existing, unexpired set alone. Minting a fresh CA invalidates everything the old
+one signed, so an init container that regenerates on every `up` breaks mutual
+TLS for any service that did not happen to restart with it.
+
 Every MongoDB instance is a **single-node replica set**, which transactions and
 change streams both require. From inside the compose network use the set name;
 from the host use `directConnection=true`, because each set advertises its
@@ -670,7 +684,9 @@ Deliberately few. Config parsing, JSON, HTTP, and logging need no third party.
 - `github.com/go-chi/chi/v5` — router, reachable only from `internal/router/chirouter`
 - `go.mongodb.org/mongo-driver/v2` — **v2, not v1.** The API differs: `mongo.Connect`
   takes options only, no `context.Context`, and it does not contact the server, so
-  a `Ping` is what turns an unreachable database into a startup failure.
+  a `Ping` is what turns an unreachable database into a startup failure. Write and
+  read concerns are set to `majority` in `internal/database`, so the code is
+  already correct on a multi-node set and costs nothing on a single-node one.
 - `github.com/prometheus/client_golang` — metrics. Collectors are registered on
   an explicit `prometheus.NewRegistry()` built in `main`, never the package-level
   default, so there is no global state and tests can use a throwaway registry.

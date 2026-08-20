@@ -207,7 +207,7 @@ moves throughput by **3%** and takes MongoDB from **685,062 reads to 4**. Add a
 cache to protect a dependency, not to lower latency — and measure which one you
 are protecting.
 
-## Three bugs that only running it would find
+## Bugs that only running it would find
 
 Written down because they are the argument for integration tests over confidence.
 
@@ -223,6 +223,40 @@ the transaction took it to 0.05s.
 directory holding every protobuf contract and generated file. Formatting, vet,
 tests and `go build` were all green; only the Docker build, which copies the
 repository as git would, failed.
+
+**A one-second stall on every published event, found by the first trace.** The
+end-to-end trace of a checkout came back with an `outbox publish order.events`
+span of 1006ms, holding nothing but a single Kafka write. kafka-go batches, and
+its default `BatchTimeout` is one second — so a lone message waits the whole
+second before it is flushed. The relay publishes one event per iteration, which
+capped it at roughly one event per second: an outbox that could not have kept up
+with any real traffic, while every health check stayed green and every test
+passed. A 10ms batch window took the span to 20ms. Nothing but the trace was
+ever going to show this, which is the argument for the trace.
+
+**An init container that broke mutual TLS every time it ran.** `certgen` minted
+a fresh CA on each `docker compose up`, and a new CA invalidates every
+certificate the old one signed. A partial restart — Product recreated, Order
+not — left Order trusting an authority that no longer existed, and every stock
+reservation failed with "certificate signed by unknown authority" while both
+containers stayed healthy and neither log mentioned certificates until the
+handshake itself. Generation is now idempotent: an existing, unexpired set is
+left alone, the same property `kafka.EnsureTopic` has and for the same reason.
+
+**A configuration rule that made asymmetric JWT impossible to deploy.** `Load`
+rejected a service that had `JWT_PUBLIC_KEY` and no `JWT_PRIVATE_KEY` as "half a
+pair" — but that is the *correct* configuration for every service except the
+issuer, and the entire reason for splitting the key. Five of the six services
+crash-looped on first start in that mode. The unit tests had only ever exercised
+both-or-neither.
+
+**A shared context key that two middlewares fought over.** Tracing and metrics
+both want the matched route pattern, and both prepared the request to receive
+it. The second call installed a second holder, the router filled that one, and
+the outer middleware — tracing — named every single span `GET unmatched` while
+the metrics underneath it looked perfectly correct. Testing either middleware
+alone proved nothing; the regression test stacks them in the order `appserver`
+actually registers them.
 
 **A duplicate WebSocket message.** Connecting a real viewer showed
 `viewer.joined` twice — once sent directly to the new socket and once from the
@@ -240,12 +274,13 @@ created with three partitions.
 
 What is left, in the order it should be fixed:
 
-1. **Single-node replica sets and one Kafka broker.** The last item from the
-   original list, and the only one that is a deployment decision rather than
-   code. The URIs name replica sets, the driver is set to `majority` reads and
-   writes, and `KAFKA_PARTITIONS` is three — so adding members is compose and
-   an `rs.reconfig`, not a rewrite. On a laptop they are still single points of
-   failure.
+1. **The default stack still runs one-member sets and one Kafka broker.**
+   `docker-compose.ha.yml` overlays a three-member set on the Product service
+   and is the proof that nothing in Go changes for it — the primary was killed,
+   a secondary was elected, and the service kept serving reads and writes with
+   no errors and readiness never dropping. It is opt-in because eighteen mongod
+   processes is the wrong default for a laptop, and Kafka is still a single
+   broker at `replicationFactor: 1`.
 2. **No dead-letter topic.** A message a consumer cannot handle is retried
    forever and blocks its partition behind it.
 3. **No rate limiting or circuit breaking.** The Order → Product call has a

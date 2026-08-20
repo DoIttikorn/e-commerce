@@ -72,6 +72,29 @@ election could erase. On a one-member set `majority` is identical to `w:1` and
 costs nothing — which is why it is set now, rather than being a change somebody
 has to remember when members are added.
 
+That claim is checkable rather than asserted:
+
+```bash
+make docker-run-ha     # three-member set for Product; everything else unchanged
+
+docker compose exec mongo-product mongosh --quiet --eval \
+  'rs.status().members.forEach(m => print(m.name + "  " + m.stateStr))'
+# mongo-product:27017    PRIMARY
+# mongo-product-2:27017  SECONDARY
+# mongo-product-3:27017  SECONDARY
+
+docker compose stop mongo-product          # kill the primary
+curl -s localhost:8082/readyz              # {"status":"ready"}
+curl -s 'localhost:8082/api/v1/products?limit=1' | jq '.total'
+```
+
+A secondary is elected, the driver finds it, and reads and writes carry on —
+with no error logged and readiness never dropping. Not one line of Go changes
+for it, which is the whole point: the URI already names the set, and the driver
+already discovers members. Three members for all six services would be eighteen
+mongod processes, so it is an opt-in overlay
+([docker-compose.ha.yml](docker-compose.ha.yml)) rather than the default.
+
 The admin port carries Prometheus metrics and pprof. It is never the API port —
 pprof can dump process memory and stall the process, so it belongs on an
 internal interface in a real deployment.
@@ -540,15 +563,17 @@ make traces          # or open http://localhost:16686
 ```
 
 Place an order (step 7 above), then pick **Service: order**, **Operation:
-POST /api/v1/orders**, and **Find Traces**. One trace, and reading down it:
+`POST /api/v1/orders/`**, and **Find Traces**. One trace, and reading down it —
+this is a real one, copied out of the API:
 
 ```
-POST /api/v1/orders                          order        142ms
-├── product.v1.StockService/Reserve          order         38ms   (client)
-│   └── product.v1.StockService/Reserve      product       31ms   (server)
-├── product.v1.StockService/Confirm          order          6ms
-└── outbox publish order.events              order          9ms   (producer)
-    └── consume order.events                 marketplace    4ms   (consumer)
+order         POST /api/v1/orders/                 138ms   (server)
+order         product.v1.StockService/Reserve       65ms   (client)
+product       product.v1.StockService/Reserve       28ms   (server)
+order         product.v1.StockService/Confirm        1ms   (client)
+product       product.v1.StockService/Confirm        0ms   (server)
+order         outbox publish order.events           20ms   (producer)
+marketplace   consume order.events                   0ms   (consumer)
 ```
 
 The last two lines are the ones worth the effort. The publish did not happen
@@ -655,9 +680,19 @@ token names is the classic JWT bypass — a token declaring `alg: none` carries 
 signature, and one declaring `RS256` can be signed with the public key as an
 HMAC secret. There is a test for both.
 
-All three services verify with the same secret today. In production the issuer
-should hold a **private** key and the others only the public one, so that a
-compromised product service cannot mint tokens.
+Both schemes are built, and which one runs is a configuration choice:
+
+- **`JWT_SECRET` (HS256)** — what the brief specifies, and what a single service
+  needs. Everyone holding the secret to verify also holds the secret to sign,
+  which is unremarkable when there is only one everyone.
+- **A key pair (EdDSA)** — `make keys` prints both halves. Give
+  `JWT_PRIVATE_KEY` to the user service and nothing else; every other service
+  gets only `JWT_PUBLIC_KEY` and therefore cannot mint a token however
+  thoroughly it is compromised. Set them and they take precedence over
+  `JWT_SECRET`.
+
+A public key with no private key is the correct, expected configuration for the
+five verify-only services — not half a pair.
 
 ## API
 

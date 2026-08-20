@@ -1,0 +1,83 @@
+# A three-member replica set for the Product service, as an opt-in overlay.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ha.yml up -d
+#
+# Why this is separate rather than the default: the base stack gives every
+# service a one-member set, which is enough for transactions and change streams
+# and costs one container each. Three members for all six would be eighteen
+# mongod processes on a laptop, and the point can be made once.
+#
+# Product is the one worth demonstrating on, because it holds the write that
+# must not be lost — the conditional stock decrement — and `majority` write
+# concern only means anything when there is a majority to wait for.
+#
+# What this proves is not that the code changes for it. Nothing here touches
+# Go: the URI already names the set, the driver already discovers members, and
+# `internal/database` already asks for majority reads and writes. That is the
+# claim, and this file is how to check it.
+
+services:
+  mongo-product:
+    # Replaces the base healthcheck, which initiates a one-member set. This one
+    # also reconfigures an existing single-member set up to three, so switching
+    # an already-running stack over does not mean deleting the volume.
+    healthcheck:
+      test: >-
+        mongosh --quiet --eval "
+          const members = [
+            { _id: 0, host: 'mongo-product:27017',   priority: 2 },
+            { _id: 1, host: 'mongo-product-2:27017', priority: 1 },
+            { _id: 2, host: 'mongo-product-3:27017', priority: 1 }
+          ];
+          try {
+            const status = rs.status();
+            if (status.members.length < 3) {
+              const conf = rs.conf();
+              conf.members = members;
+              conf.version = conf.version + 1;
+              rs.reconfig(conf, { force: true });
+            }
+            status.ok
+          } catch (e) {
+            rs.initiate({ _id: 'rs-product', members: members }).ok
+          }
+        "
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  # The two extra members. They are added to the set by the primary above, so
+  # they need no initiation logic of their own — only the same set name.
+  mongo-product-2:
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["--replSet", "rs-product", "--bind_ip_all"]
+    ports:
+      - "27119:27017"
+    volumes:
+      - mongo-product-data-2:/data/db
+
+  mongo-product-3:
+    image: mongo:8.0
+    restart: unless-stopped
+    command: ["--replSet", "rs-product", "--bind_ip_all"]
+    ports:
+      - "27219:27017"
+    volumes:
+      - mongo-product-data-3:/data/db
+
+  product:
+    depends_on:
+      mongo-product-2:
+        condition: service_started
+      mongo-product-3:
+        condition: service_started
+    environment:
+      # Unchanged in shape: the seed host plus the set name. The driver finds
+      # the other two itself, which is exactly why no code changes for this.
+      MONGO_URI: "mongodb://mongo-product:27017/?replicaSet=rs-product"
+
+volumes:
+  mongo-product-data-2:
+  mongo-product-data-3:

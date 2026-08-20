@@ -82,6 +82,11 @@ kafka-ui:
 	@echo "http://localhost:8090 -> Topics -> seller.events -> Messages"
 	@open http://localhost:8090 2>/dev/null || echo "open http://localhost:8090"
 
+## docker-run-ha: the stack with a three-member replica set for Product
+##                proves a failover changes no code — see docker-compose.ha.yml
+docker-run-ha:
+	@docker compose -f docker-compose.yml -f docker-compose.ha.yml up -d --build --remove-orphans
+
 ## traces: open the trace UI (the stack must be running)
 traces:
 	@echo "http://localhost:16686 -> Service: order -> Find Traces"
@@ -104,4 +109,4 @@ clean:
 	@echo "Cleaning..."
 	@rm -rf bin tmp
 
-.PHONY: help all build run watch lint test itest load-smoke load-read load-auth keys certs proto kafka-ui traces docker-run docker-logs docker-down docker-clean clean
+.PHONY: help all build run watch lint test itest load-smoke load-read load-auth keys certs proto kafka-ui traces docker-run docker-run-ha docker-logs docker-down docker-clean clean

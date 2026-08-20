@@ -20,14 +20,39 @@ import (
 // is one nobody ever practises replacing.
 const validity = 90 * 24 * time.Hour
 
+// renewWithin is how close to expiry an existing set has to be before Generate
+// replaces it rather than leaving it alone.
+const renewWithin = 7 * 24 * time.Hour
+
+// generated is every file a complete set consists of. A directory holding some
+// of them is a half-written set, and is replaced rather than trusted.
+var generated = []string{
+	"ca.pem", "server.pem", "server-key.pem", "client.pem", "client-key.pem",
+}
+
 // Generate writes a CA, a server key pair and a client key pair into dir.
 //
 // Development only. A real deployment gets certificates from something that can
 // rotate and revoke them; this exists so the compose stack and the test suite
 // have a CA without anyone committing a private key.
+//
+// It is idempotent, and that is not a nicety. Running it again mints a *new* CA,
+// and a new CA invalidates every certificate the old one signed — so a
+// `docker compose up` that restarted the server but not its client left the
+// client trusting an authority that no longer existed, and every call failed
+// with "certificate signed by unknown authority". Regenerating only when the
+// set is missing or nearly expired makes re-running it safe, which is the same
+// property kafka.EnsureTopic has and for the same reason.
 func Generate(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
+	}
+
+	if usable, err := existingSetIsUsable(dir); err != nil {
+		return err
+	} else if usable {
+		fmt.Printf("certificates in %s are still valid; leaving them alone\n", dir)
+		return nil
 	}
 
 	caCert, caKey, caPEM, err := makeCA()
@@ -154,4 +179,38 @@ func write(dir, name string, body []byte, mode os.FileMode) error {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
+}
+
+// existingSetIsUsable reports whether dir already holds a complete set that is
+// not about to expire.
+//
+// Anything unreadable, unparseable, or incomplete counts as unusable rather
+// than as an error: the caller's job is to produce a working set, and the
+// cheapest way to fix a broken one is to write a new one over it.
+func existingSetIsUsable(dir string) (bool, error) {
+	for _, name := range generated {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			if os.IsNotExist(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("stat %s: %w", name, err)
+		}
+	}
+
+	// The server certificate is the one that expires first in practice, and a
+	// client that trusts a CA whose leaf has expired fails in the same way as
+	// one that trusts nothing. Checking it covers the set.
+	body, err := os.ReadFile(filepath.Join(dir, "server.pem"))
+	if err != nil {
+		return false, nil
+	}
+	block, _ := pem.Decode(body)
+	if block == nil {
+		return false, nil
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false, nil
+	}
+	return time.Until(cert.NotAfter) > renewWithin, nil
 }
