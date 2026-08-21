@@ -28,7 +28,7 @@ func certDir(t *testing.T) string {
 	t.Helper()
 
 	dir := t.TempDir()
-	if err := servicetls.Generate(dir); err != nil {
+	if _, err := servicetls.Generate(dir); err != nil {
 		t.Fatalf("generating certificates: %v", err)
 	}
 	return dir
@@ -177,8 +177,10 @@ func TestGeneratingTwiceLeavesTheCertificatesAlone(t *testing.T) {
 		t.Fatalf("read ca: %v", err)
 	}
 
-	if err := servicetls.Generate(dir); err != nil {
+	if written, err := servicetls.Generate(dir); err != nil {
 		t.Fatalf("second Generate() error = %v", err)
+	} else if written {
+		t.Error("the second run rewrote the certificates")
 	}
 
 	second, err := os.ReadFile(filepath.Join(dir, "ca.pem"))
@@ -204,8 +206,10 @@ func TestAClientKeepsWorkingAcrossASecondGenerate(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	// Stands in for the init container running again on the next compose up.
-	if err := servicetls.Generate(dir); err != nil {
+	if written, err := servicetls.Generate(dir); err != nil {
 		t.Fatalf("second Generate() error = %v", err)
+	} else if written {
+		t.Error("the second run rewrote the certificates")
 	}
 
 	if _, err := client.Reserve(ctx, "mtls-regen", oneLine(fix.item.ID, 1)); err != nil {
@@ -220,8 +224,10 @@ func TestAMissingFileCausesAFullRegeneration(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "client-key.pem")); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	if err := servicetls.Generate(dir); err != nil {
+	if written, err := servicetls.Generate(dir); err != nil {
 		t.Fatalf("Generate() error = %v", err)
+	} else if !written {
+		t.Fatal("an incomplete set was left alone instead of being replaced")
 	}
 
 	for _, name := range []string{"ca.pem", "server.pem", "server-key.pem", "client.pem", "client-key.pem"} {

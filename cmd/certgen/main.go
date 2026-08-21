@@ -24,9 +24,19 @@ func main() {
 		dir = os.Args[1]
 	}
 
-	if err := servicetls.Generate(dir); err != nil {
+	// Idempotent on purpose: this runs as an init container on every
+	// `docker compose up`, and minting a fresh CA would invalidate every
+	// certificate the old one signed — breaking mutual TLS for whichever
+	// service did not happen to restart alongside it.
+	written, err := servicetls.Generate(dir)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "generating certificates failed:", err)
 		os.Exit(1)
+	}
+
+	if !written {
+		fmt.Printf("certificates in %s are still valid; leaving them alone\n", dir)
+		return
 	}
 	fmt.Printf("wrote ca.pem, server.pem, server-key.pem, client.pem and client-key.pem to %s\n", dir)
 }

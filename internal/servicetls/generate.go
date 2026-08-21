@@ -36,6 +36,10 @@ var generated = []string{
 // rotate and revoke them; this exists so the compose stack and the test suite
 // have a CA without anyone committing a private key.
 //
+// It reports whether it actually wrote anything, so a caller can say which of
+// the two happened. It does not print: a library that writes to stdout is one
+// that cannot be used quietly.
+//
 // It is idempotent, and that is not a nicety. Running it again mints a *new* CA,
 // and a new CA invalidates every certificate the old one signed — so a
 // `docker compose up` that restarted the server but not its client left the
@@ -43,24 +47,23 @@ var generated = []string{
 // with "certificate signed by unknown authority". Regenerating only when the
 // set is missing or nearly expired makes re-running it safe, which is the same
 // property kafka.EnsureTopic has and for the same reason.
-func Generate(dir string) error {
+func Generate(dir string) (written bool, err error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+		return false, err
 	}
 
 	if usable, err := existingSetIsUsable(dir); err != nil {
-		return err
+		return false, err
 	} else if usable {
-		fmt.Printf("certificates in %s are still valid; leaving them alone\n", dir)
-		return nil
+		return false, nil
 	}
 
 	caCert, caKey, caPEM, err := makeCA()
 	if err != nil {
-		return fmt.Errorf("ca: %w", err)
+		return false, fmt.Errorf("ca: %w", err)
 	}
 	if err := write(dir, "ca.pem", caPEM, 0o644); err != nil {
-		return err
+		return false, err
 	}
 
 	// The server certificate names every address a client might dial it on:
@@ -70,13 +73,13 @@ func Generate(dir string) error {
 	serverPEM, serverKeyPEM, err := issue(caCert, caKey, "product", true,
 		[]string{"product", "localhost"}, []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")})
 	if err != nil {
-		return fmt.Errorf("server: %w", err)
+		return false, fmt.Errorf("server: %w", err)
 	}
 	if err := write(dir, "server.pem", serverPEM, 0o644); err != nil {
-		return err
+		return false, err
 	}
 	if err := write(dir, "server-key.pem", serverKeyPEM, 0o600); err != nil {
-		return err
+		return false, err
 	}
 
 	// The client certificate identifies the caller. Its common name is what the
@@ -84,12 +87,12 @@ func Generate(dir string) error {
 	// not depend on the caller being honest about it.
 	clientPEM, clientKeyPEM, err := issue(caCert, caKey, "order", false, nil, nil)
 	if err != nil {
-		return fmt.Errorf("client: %w", err)
+		return false, fmt.Errorf("client: %w", err)
 	}
 	if err := write(dir, "client.pem", clientPEM, 0o644); err != nil {
-		return err
+		return false, err
 	}
-	return write(dir, "client-key.pem", clientKeyPEM, 0o600)
+	return true, write(dir, "client-key.pem", clientKeyPEM, 0o600)
 }
 
 func makeCA() (*x509.Certificate, ed25519.PrivateKey, []byte, error) {
