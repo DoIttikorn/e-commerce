@@ -636,8 +636,17 @@ curl -s -D- -o /dev/null localhost:8080/healthz -H 'X-Request-ID: trace-me-123' 
 make docker-logs SERVICE=user
 ```
 
-Full request collections: [test/http/api.http](test/http/api.http) for REST
-(VS Code REST Client), [test/grpc/requests.md](test/grpc/requests.md) for gRPC.
+**Sequence diagrams for every endpoint** are in
+[docs/sequence-diagrams/](docs/sequence-diagrams/) — 42 per language, English and
+Thai, with the saga, the outbox, the mutual-TLS handshake and the WebSocket
+drawn in full. Start with
+[the order saga](docs/sequence-diagrams/order.md#-place-an-order--the-saga).
+
+Full request collections: **[postman/](postman/)** for Postman — 54 requests
+across all six services, every one annotated in English and Thai, and the whole
+collection passes end to end in the Runner. Also
+[test/http/api.http](test/http/api.http) for the VS Code REST Client, and
+[test/grpc/requests.md](test/grpc/requests.md) for gRPC.
 
 ## JWT
 

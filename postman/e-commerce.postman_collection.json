@@ -1,0 +1,2491 @@
+{
+  "info": {
+    "_postman_id": "e0c0ffee-1a2b-4c3d-8e5f-e0c0mmerce001",
+    "name": "e-commerce — six services, one flow",
+    "description": "**EN** — A runnable tour of a six-service Go e-commerce backend: **user, seller, product,\norder, marketplace, live**. Each service is its own binary with its **own MongoDB\ninstance**. They talk through Kafka events, with exactly one exception — Order\ncalls Product over gRPC to reserve stock, because a buyer cannot be told their\norder exists until the stock is secured.\n\n### Before you start\n\n```bash\nmake docker-run      # the whole stack\ncurl localhost:8080/readyz\n```\n\nThen import `e-commerce.postman_environment.json` too, and select it in the\nenvironment dropdown — the collection will not resolve `{{userBase}}` without it.\n\n### Run the folders in order\n\n`01 Auth` fills `{{token}}`, and everything after it depends on that. Then 03\nseller → 04 product → 05 order, because each folder captures the ID the next one\nneeds. Folder 08 is failures, 09 is tracing; both can run any time after 05.\n\n**The Collection Runner works**: select the collection, run folders 01 → 07 in\norder, and every request asserts on its own status and captures what the next one\nneeds. The one thing to watch is folder 04 — the Product service learns about\nshops from an event stream, so a product create in the same second as the shop\ncreate can fail with an unknown seller. Wait a second and re-run it.\n\n### Two UIs worth having open\n\n| | |\n|---|---|\n| **Kafka UI** | http://localhost:8090 — topics, partitions, consumer lag |\n| **Jaeger** | http://localhost:16686 — one request across every service it touched |\n\n### Conventions\n\n- JSON field names are `snake_case`.\n- Money is an integer count of **minor units** (`price_minor`) plus a currency\n  code. `25000` is ฿250.00. Never a float.\n- Errors are `{\"error\": \"...\"}`, with a `fields` object on validation failures.\n- **PATCH, not PUT** — an omitted field is left alone.\n- **400** for a malformed ID, **404** for a well-formed one that does not exist.\n\n---\n\n**TH** — ทัวร์ที่รันได้จริงของ backend e-commerce ภาษา Go ที่มี 6 services:\n**user, seller, product, order, marketplace, live** — แต่ละตัวเป็น binary ของตัวเอง\nและมี **MongoDB เป็นของตัวเอง** คุยกันผ่าน Kafka event โดยมีข้อยกเว้นเดียวคือ\nOrder เรียก Product ผ่าน gRPC เพื่อจอง stock เพราะจะบอกผู้ซื้อว่าสั่งซื้อสำเร็จไม่ได้\nจนกว่าจะจอง stock ได้จริง\n\n### ก่อนเริ่ม\n\n```bash\nmake docker-run      # ทั้ง stack\ncurl localhost:8080/readyz\n```\n\nแล้ว import `e-commerce.postman_environment.json` ด้วย และเลือกใน dropdown ของ environment\nไม่งั้น collection จะแปลค่า `{{userBase}}` ไม่ออก\n\n### รัน folder ตามลำดับ\n\n`01 Auth` จะเติมค่า `{{token}}` และทุกอย่างหลังจากนั้นต้องใช้มัน จากนั้น\n03 seller → 04 product → 05 order เพราะแต่ละ folder จะเก็บ ID ที่ folder ถัดไปต้องใช้\nส่วน folder 08 คือกรณีพัง และ 09 คือ tracing รันเมื่อไหร่ก็ได้หลังจาก 05\n\n**ใช้ Collection Runner ได้**: เลือก collection แล้วรัน folder 01 → 07 ตามลำดับ\nทุก request จะตรวจ status ของตัวเองและเก็บค่าที่ตัวถัดไปต้องใช้\nสิ่งเดียวที่ต้องระวังคือ folder 04 — Product service รู้จักร้านค้าจาก event stream\nถ้าสร้างสินค้าในวินาทีเดียวกับที่สร้างร้าน อาจ fail เพราะยังไม่รู้จัก seller\nรอสักวินาทีแล้วรันใหม่\n\n### UI สองตัวที่ควรเปิดไว้\n\n| | |\n|---|---|\n| **Kafka UI** | http://localhost:8090 — topic, partition, consumer lag |\n| **Jaeger** | http://localhost:16686 — ดู request เดียวข้ามทุก service ที่มันวิ่งผ่าน |\n\n### ข้อตกลงร่วม\n\n- ชื่อ field ใน JSON เป็น `snake_case`\n- เงินเก็บเป็นจำนวนเต็มของ **หน่วยย่อย** (`price_minor`) บวกรหัสสกุลเงิน\n  `25000` คือ ฿250.00 ห้ามเป็น float\n- error คือ `{\"error\": \"...\"}` และมี `fields` เพิ่มมาเมื่อ validation ไม่ผ่าน\n- **PATCH ไม่ใช่ PUT** — field ที่ไม่ส่งมาจะไม่ถูกแตะ\n- **400** สำหรับ ID ผิดรูปแบบ, **404** สำหรับ ID ที่รูปแบบถูกแต่ไม่มีของ",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Nothing global is needed: each request sets what it owns."
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// A 5xx is never an expected answer anywhere in this collection.",
+          "pm.test('not a server error', function () {",
+          "  pm.expect(pm.response.code, 'a 5xx means the service failed, not the request')",
+          "    .to.be.below(500);",
+          "});"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "userBase",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "sellerBase",
+      "value": "http://localhost:8081"
+    },
+    {
+      "key": "productBase",
+      "value": "http://localhost:8082"
+    },
+    {
+      "key": "orderBase",
+      "value": "http://localhost:8083"
+    },
+    {
+      "key": "marketBase",
+      "value": "http://localhost:8084"
+    },
+    {
+      "key": "liveBase",
+      "value": "http://localhost:8085"
+    },
+    {
+      "key": "adminBase",
+      "value": "http://localhost:6060"
+    },
+    {
+      "key": "email",
+      "value": ""
+    },
+    {
+      "key": "token",
+      "value": ""
+    },
+    {
+      "key": "userId",
+      "value": ""
+    },
+    {
+      "key": "sellerId",
+      "value": ""
+    },
+    {
+      "key": "productId",
+      "value": ""
+    },
+    {
+      "key": "orderId",
+      "value": ""
+    },
+    {
+      "key": "cancelOrderId",
+      "value": ""
+    },
+    {
+      "key": "streamId",
+      "value": ""
+    },
+    {
+      "key": "idempotencyKey",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "00 · Health & Observability",
+      "description": "**EN** — Liveness, readiness, and the admin port. Run these first: if `/readyz` is not\n200 the rest of the collection will fail in ways that look like bugs in the\nrequests rather than a stack that has not finished starting.\n\n---\n\n**TH** — liveness, readiness และ admin port — ควรรันชุดนี้ก่อนเสมอ ถ้า `/readyz` ยังไม่ 200\nrequest อื่น ๆ จะพังในแบบที่ดูเหมือน request เขียนผิด ทั้งที่จริงคือ stack ยังไม่พร้อม",
+      "item": [
+        {
+          "name": "Liveness — user",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{userBase}}/healthz",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "description": "**EN** — Returns 200 whenever the process is running, and checks **no dependencies at\nall**. That is deliberate: a failing Kubernetes liveness probe restarts the pod,\nso putting a database check here would turn a brief MongoDB blip into a restart\nloop across every instance at once — an outage where there was only degradation.\n\n---\n\n**TH** — คืน 200 ตราบใดที่ process ยังรันอยู่ และ **ไม่เช็ค dependency ใด ๆ เลย** ซึ่งตั้งใจ:\nliveness probe ของ Kubernetes ที่ fail จะ restart pod ทิ้ง ถ้าเอา database check มาไว้ตรงนี้\nMongoDB สะดุดแป๊บเดียวจะกลายเป็น restart loop พร้อมกันทุก instance — จากแค่ช้าลง กลายเป็นล่มทั้งระบบ",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"says ok\", () => pm.expect(pm.response.json().status).to.eql(\"ok\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Readiness — user",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{userBase}}/readyz",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "readyz"
+              ]
+            },
+            "description": "**EN** — Pings MongoDB with a 2 second timeout. **This** is where dependency checks\nbelong: a failing readiness probe removes the instance from the load balancer\nand leaves it running to recover, so it rejoins by itself when the dependency\nreturns. Verified by stopping MongoDB — liveness stayed 200, readiness went 503,\nand readiness recovered on its own.\n\n---\n\n**TH** — ping MongoDB โดยมี timeout 2 วินาที — **ตรงนี้ต่างหาก** ที่ควรเช็ค dependency\nreadiness ที่ fail จะถอน instance ออกจาก load balancer แต่ปล่อยให้ process รันต่อเพื่อฟื้นตัว\nพอ dependency กลับมาก็เข้า pool เองอัตโนมัติ ทดสอบจริงด้วยการหยุด MongoDB แล้ว\nliveness ยัง 200, readiness เป็น 503 และ readiness ฟื้นเองเมื่อ MongoDB กลับมา",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Readiness — every service",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{productBase}}/readyz",
+              "host": [
+                "{{productBase}}"
+              ],
+              "path": [
+                "readyz"
+              ]
+            },
+            "description": "**EN** — Same endpoint on Product. Change the port to check the others: 8080 user,\n8081 seller, 8082 product, 8083 order, 8084 marketplace, 8085 live. Product also\nreports Redis here — and reports it as *ready* when Redis is down, because the\ncache is a decorator over the repository and the service still serves every\nrequest from MongoDB without it. A cache that fails the request when it is\nunavailable has stopped being a cache and become a dependency.\n\n---\n\n**TH** — endpoint เดียวกันบน Product เปลี่ยน port เพื่อเช็คตัวอื่น: 8080 user, 8081 seller,\n8082 product, 8083 order, 8084 marketplace, 8085 live — Product เช็ค Redis ด้วย\nแต่ยังตอบว่า *ready* ถึงแม้ Redis ล่ม เพราะ cache เป็น decorator ครอบ repository\nservice ยังอ่านจาก MongoDB ได้ครบทุก request ถ้า Redis ล่มแล้ว request พังตาม\nแปลว่ามันไม่ใช่ cache แล้ว แต่กลายเป็น dependency",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Correlation ID echo",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Request-ID",
+                "value": "postman-{{$randomUUID}}"
+              }
+            ],
+            "url": {
+              "raw": "{{userBase}}/healthz",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "description": "**EN** — Any request echoes its correlation ID back, generating one when the caller\nsends none. The same value appears as `request_id` on every log line written\nwhile serving that request — `make docker-logs SERVICE=user` and grep for it.\nAn inbound value over 64 bytes or containing non-printable ASCII is discarded\nand replaced, because the header is client-controlled and ends up in the logs:\nthat is a log-forging vector.\n\n---\n\n**TH** — ทุก request จะสะท้อน correlation ID กลับมา และถ้า caller ไม่ส่งมาก็จะสร้างให้เอง\nค่าเดียวกันนี้จะปรากฏเป็น `request_id` บนทุกบรรทัด log ที่เขียนระหว่างเสิร์ฟ request นั้น\nลอง `make docker-logs SERVICE=user` แล้ว grep ดู — ถ้าค่าที่ส่งเข้ามายาวเกิน 64 bytes\nหรือมีอักขระที่ไม่ใช่ printable ASCII จะถูกทิ้งแล้วสร้างใหม่ เพราะ header นี้ client\nควบคุมได้และมันไปจบใน log ซึ่งเป็นช่องทาง log forging",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"echoes the id back\", () =>",
+                  "  pm.expect(pm.response.headers.get(\"X-Request-ID\")).to.be.a(\"string\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Prometheus metrics (admin port)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{adminBase}}/metrics",
+              "host": [
+                "{{adminBase}}"
+              ],
+              "path": [
+                "metrics"
+              ]
+            },
+            "description": "**EN** — RED signals — rate, errors, duration — plus Go runtime collectors. Note the\n`route` label on `http_requests_total`: it is the **route pattern**\n(`/api/v1/users/{id}`), never the raw path. A raw path would mint one time\nseries per user ID, and unbounded label cardinality is the standard way a\nmonitored service takes down its own monitoring.\n\n---\n\n**TH** — RED signals — rate, errors, duration — บวก Go runtime collectors สังเกต label\n`route` บน `http_requests_total`: มันคือ **route pattern** (`/api/v1/users/{id}`)\nไม่ใช่ path ดิบ ถ้าใช้ path ดิบจะเกิด time series หนึ่งเส้นต่อ user หนึ่งคน และ\nlabel cardinality ที่ไม่มีขอบเขตคือวิธีมาตรฐานที่ service จะล้ม monitoring ของตัวเอง",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"labels by route pattern, not path\", () =>",
+                  "  pm.expect(pm.response.text()).to.include(\"http_requests_total\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "pprof is NOT on the API port",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{userBase}}/debug/pprof/",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "debug",
+                "pprof"
+              ]
+            },
+            "description": "**EN** — Must be **404**. pprof can dump process memory and stall the process for the\nlength of a profile, so it lives on `ADMIN_ADDR` (`:6060`) and never on the\npublic API port. There is a Go test asserting exactly this; the request is here\nso you can see it rather than take it on trust.\n\n---\n\n**TH** — ต้องได้ **404** — pprof สามารถ dump memory ของ process และทำให้ process ค้าง\nตลอดช่วงที่ profile อยู่ จึงต้องอยู่บน `ADMIN_ADDR` (`:6060`) เท่านั้น ห้ามอยู่บน API port\nมี Go test ยืนยันข้อนี้อยู่แล้ว แต่ใส่ request นี้ไว้ให้เห็นกับตา ไม่ต้องเชื่อลอย ๆ",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404 — the profiler is not public\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "01 · Auth  (user :8080)",
+      "description": "**EN** — Register, then log in. **Run these two in order before anything else** — the\nlogin response is what fills the `token` variable every other folder depends on.\n\n---\n\n**TH** — สมัคร แล้วล็อกอิน — **ต้องรันสองอันนี้ตามลำดับก่อนทุกอย่าง** เพราะ response ของ login\nคือสิ่งที่เติมค่าตัวแปร `token` ที่ folder อื่นทั้งหมดใช้",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{userBase}}/api/v1/auth/register",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "register"
+              ]
+            },
+            "description": "**EN** — Creates an account. Public — this is the one endpoint that cannot require a\ntoken, since a token is what it exists to make possible.\n\nThe password is hashed with **bcrypt** and the hash never appears in any\nresponse, any gRPC message, or any log line. Email uniqueness is enforced by a\n**unique index in MongoDB**, not by an application-level \"does this exist?\"\ncheck: that check races, and under concurrent registration two callers both read\n\"no\" and both insert.\n\n---\n\n**TH** — สร้างบัญชี — เป็น public เพราะเป็น endpoint เดียวที่บังคับให้มี token ไม่ได้\nในเมื่อ token คือสิ่งที่มันมีไว้เพื่อสร้าง\n\npassword ถูก hash ด้วย **bcrypt** และตัว hash จะไม่โผล่ใน response, gRPC message\nหรือ log บรรทัดไหนเลย ส่วนความไม่ซ้ำของอีเมลบังคับด้วย **unique index ใน MongoDB**\nไม่ใช่การเช็คระดับ application ว่า \"มีอยู่แล้วหรือยัง\" เพราะการเช็คแบบนั้น race:\nถ้าสมัครพร้อมกันสองคน ทั้งคู่จะอ่านได้ว่า \"ยังไม่มี\" แล้ว insert ทั้งคู่",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Ittikorn\",\n  \"email\": \"{{email}}\",\n  \"password\": \"correct-horse-battery-staple\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A fresh address each run, so re-running never hits the 409 path by accident.",
+                  "pm.collectionVariables.set(\"email\", \"postman-\" + Date.now() + \"@example.com\");"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 Created\", () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test(\"no password hash leaks into the response\", () => {",
+                  "  pm.expect(pm.response.text()).to.not.include(\"$2a$\");",
+                  "  pm.expect(body).to.not.have.property(\"password\");",
+                  "});",
+                  "pm.collectionVariables.set(\"userId\", body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login → captures the token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{userBase}}/api/v1/auth/login",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "login"
+              ]
+            },
+            "description": "**EN** — Returns a JWT and its expiry. The test script stores the token in the `token`\ncollection variable, which the collection-level bearer auth then applies to\nevery authenticated request — you never paste a token by hand.\n\nAn unknown email and a wrong password return an **identical 401**, so login\ncannot be used to discover which addresses are registered.\n\n---\n\n**TH** — คืน JWT พร้อมเวลาหมดอายุ — test script จะเก็บ token ลงตัวแปร `token` ของ collection\nแล้ว bearer auth ระดับ collection จะแนบให้ทุก request ที่ต้อง auth เอง ไม่ต้อง copy token เอง\n\nอีเมลที่ไม่มีในระบบ กับ รหัสผ่านผิด จะได้ **401 ที่หน้าตาเหมือนกันเป๊ะ**\nเพื่อไม่ให้ใช้หน้า login ไล่เดาว่าอีเมลไหนสมัครไว้แล้วบ้าง",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"correct-horse-battery-staple\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test(\"returns a token and an expiry\", () => {",
+                  "  pm.expect(body.token).to.be.a(\"string\");",
+                  "  pm.expect(body.expires_at).to.be.a(\"string\");",
+                  "});",
+                  "pm.collectionVariables.set(\"token\", body.token);",
+                  "console.log(\"token captured — the rest of the collection will use it\");"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "02 · Users  (user :8080)",
+      "description": "**EN** — CRUD over the account. Reads are open to any authenticated caller; PATCH and\nDELETE are restricted to the token's own subject.\n\n---\n\n**TH** — CRUD ของบัญชีผู้ใช้ — การอ่านเปิดให้ผู้ที่ล็อกอินแล้วทุกคน ส่วน PATCH และ DELETE\nจำกัดเฉพาะเจ้าของ token เท่านั้น",
+      "item": [
+        {
+          "name": "List users",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{userBase}}/api/v1/users?limit=20&offset=0",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            },
+            "description": "**EN** — Paged. `limit` and `offset` are echoed back alongside `total` so a client can\nrender pagination without a second call.\n\n---\n\n**TH** — แบ่งหน้า — `limit` และ `offset` ถูกส่งกลับมาพร้อม `total` เพื่อให้ client\nวาด pagination ได้โดยไม่ต้องยิงซ้ำอีกรอบ"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get one user",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{userBase}}/api/v1/users/{{userId}}",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "{{userId}}"
+              ]
+            },
+            "description": "**EN** — Fetch by ID. Note the error split: a **malformed** ID (not a MongoDB ObjectID)\nis **400**, while a well-formed one that does not exist is **404**. They are\ndifferent mistakes — one is a bad request, the other is a valid request for\nsomething absent — and collapsing them loses information the caller needs.\n\n---\n\n**TH** — ดึงตาม ID — สังเกตการแยก error: ID ที่ **ผิดรูปแบบ** (ไม่ใช่ MongoDB ObjectID)\nได้ **400** ส่วน ID ที่รูปแบบถูกแต่ไม่มีของ ได้ **404** เพราะมันคนละความผิดพลาด\nอันหนึ่งคือ request ผิด อีกอันคือ request ถูกแต่ไม่มีข้อมูล — ถ้ายุบรวมกันจะเสียข้อมูล\nที่ caller ต้องใช้ตัดสินใจ"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Update name or email (PATCH)",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{userBase}}/api/v1/users/{{userId}}",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "{{userId}}"
+              ]
+            },
+            "description": "**EN** — **PATCH, not PUT**, and the distinction is load-bearing. The brief asks to update\na user's name *or* email, so an omitted field must be left alone — which a\nstruct of plain strings cannot express, because an absent field and an empty\none look identical. The request struct uses `*string` so `nil` means \"not\nsupplied\" and `\"\"` means \"set it to empty\".\n\nAuthorization: the token's subject only. Another user's record answers **403**.\n\n---\n\n**TH** — **PATCH ไม่ใช่ PUT** และความต่างนี้สำคัญจริง — โจทย์บอกให้แก้ชื่อ *หรือ* อีเมล\nแปลว่า field ที่ไม่ส่งมาต้องไม่ถูกแตะ ซึ่ง struct ที่เป็น string ธรรมดาแสดงออกไม่ได้\nเพราะ \"ไม่ส่งมา\" กับ \"ส่งมาเป็นค่าว่าง\" หน้าตาเหมือนกัน จึงใช้ `*string`:\n`nil` = ไม่ได้ส่ง, `\"\"` = ตั้งใจให้เป็นค่าว่าง\n\nสิทธิ์: เฉพาะเจ้าของ token เท่านั้น ถ้าไปแก้ของคนอื่นจะได้ **403**",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Ittikorn C.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"only the named field changed\", () =>",
+                  "  pm.expect(pm.response.json().email).to.eql(pm.collectionVariables.get(\"email\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create a user directly",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{userBase}}/api/v1/users",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users"
+              ]
+            },
+            "description": "**EN** — Distinct from self-registration: this one requires a bearer token. Both exist\nbecause \"sign me up\" and \"add a user to the system\" are different operations\nwith different authorization, even though they write the same row.\n\n---\n\n**TH** — ต่างจากการสมัครเอง: เส้นนี้ต้องมี bearer token — มีทั้งสองเส้นเพราะ \"สมัครให้ฉัน\"\nกับ \"เพิ่มผู้ใช้เข้าระบบ\" เป็นคนละ operation ที่มีสิทธิ์ต่างกัน ถึงแม้จะเขียนลง row เดียวกัน",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Created By Admin\",\n  \"email\": \"created-{{$timestamp}}@example.com\",\n  \"password\": \"another-long-enough-password\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201\", () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "03 · Seller  (:8081)",
+      "description": "**EN** — Open a shop. Every write here publishes an event that the Product and\nMarketplace services consume — this is where the event-driven half of the system\nstarts, and the Kafka UI on :8090 is where you watch it.\n\n---\n\n**TH** — เปิดร้าน — ทุกการเขียนในนี้จะ publish event ที่ Product และ Marketplace consume\nนี่คือจุดเริ่มของฝั่ง event-driven ของระบบ และดูการไหลได้ที่ Kafka UI บน :8090",
+      "item": [
+        {
+          "name": "Open a shop → captures sellerId",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{sellerBase}}/api/v1/sellers",
+              "host": [
+                "{{sellerBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "sellers"
+              ]
+            },
+            "description": "**EN** — Creates the shop owned by the token's user and publishes `seller.registered`.\n\nThe event is **not** published from this request path. It is written into the\nsame MongoDB transaction as the shop row, and a background relay publishes it\nafterwards — the transactional outbox. Publishing directly would leave a window\nwhere the write commits and the publish fails, and then the shop exists while\nnobody was told; returning an error would not help, because the write already\nhappened.\n\nWatch it land: **Kafka UI → Topics → `seller.events` → Messages**.\n\n---\n\n**TH** — สร้างร้านที่เป็นของ user เจ้าของ token แล้ว publish event `seller.registered`\n\nevent **ไม่ได้** ถูก publish จาก request path นี้ แต่ถูกเขียนลง MongoDB transaction\nเดียวกันกับ row ของร้าน แล้วมี relay เบื้องหลังค่อย publish ทีหลัง — นี่คือ transactional outbox\nถ้า publish ตรง ๆ จะมีช่องว่างที่ write commit สำเร็จแต่ publish พัง แล้วร้านมีอยู่จริง\nแต่ไม่มีใครรู้ และการคืน error ก็ไม่ช่วย เพราะ write มันเกิดไปแล้ว\n\nดูได้ที่ **Kafka UI → Topics → `seller.events` → Messages**",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"shop_name\": \"Postman Shop {{$timestamp}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201\", () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set(\"sellerId\", body.id);",
+                  "pm.test(\"opens active\", () => pm.expect(body.status).to.eql(\"active\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "My shop",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{sellerBase}}/api/v1/sellers/me",
+              "host": [
+                "{{sellerBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "sellers",
+                "me"
+              ]
+            },
+            "description": "**EN** — Resolves the shop from the token's subject rather than from a path parameter.\nThere is no ID to get wrong and no way to ask for somebody else's.\n\n---\n\n**TH** — หาร้านจาก subject ของ token แทนที่จะรับ ID ทาง path — ไม่มี ID ให้ใส่ผิด\nและไม่มีทางถามหาร้านของคนอื่น"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "pm.collectionVariables.set(\"sellerId\", pm.response.json().id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List shops",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{sellerBase}}/api/v1/sellers?limit=20&offset=0",
+              "host": [
+                "{{sellerBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "sellers"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            },
+            "description": "**EN** — Paged list of every shop.\n\n---\n\n**TH** — รายการร้านทั้งหมด แบ่งหน้า"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get one shop",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{sellerBase}}/api/v1/sellers/{{sellerId}}",
+              "host": [
+                "{{sellerBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "sellers",
+                "{{sellerId}}"
+              ]
+            },
+            "description": "**EN** — Fetch by ID. Same 400-vs-404 split as the user service.\n\n---\n\n**TH** — ดึงตาม ID — แยก 400 กับ 404 แบบเดียวกับ user service"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Rename the shop  (the interesting one)",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{sellerBase}}/api/v1/sellers/{{sellerId}}",
+              "host": [
+                "{{sellerBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "sellers",
+                "{{sellerId}}"
+              ]
+            },
+            "description": "**EN** — Owner only. This publishes `seller.updated`, and it is the event that makes the\narchitecture visible: **run it, then re-run \"List products\" in folder 04 and\nwatch `seller_name` change on products nobody touched.**\n\nThe Product service never calls the Seller service. It keeps its own read model\nbuilt from this stream, so rendering a listing page costs zero outbound calls —\nand a Seller service that is down does not stop the catalogue from rendering.\n\nThe event is keyed by seller ID. Kafka orders per partition, so two renames of\none shop must share a key or they can be applied backwards.\n\n---\n\n**TH** — เฉพาะเจ้าของร้าน — เส้นนี้ publish `seller.updated` และเป็น event ที่ทำให้เห็นสถาปัตยกรรม\nชัดที่สุด: **ลองรันแล้วกลับไปรัน \"List products\" ใน folder 04 ดู\nจะเห็น `seller_name` เปลี่ยนบนสินค้าที่ไม่มีใครไปแตะเลย**\n\nProduct service ไม่เคยเรียก Seller service เลย มันสร้าง read model ของตัวเองจาก stream นี้\nการ render หน้ารายการสินค้าจึงไม่มี outbound call เลยสักครั้ง และถ้า Seller service ล่ม\nก็ไม่ได้ทำให้ดูสินค้าไม่ได้\n\nevent ใช้ seller ID เป็น key เพราะ Kafka เรียงลำดับต่อ partition ถ้าเปลี่ยนชื่อร้านสองครั้ง\nแล้วไม่ใช้ key เดียวกัน ลำดับอาจสลับกันได้",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"shop_name\": \"Renamed Shop {{$timestamp}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "console.log(\"now re-run 04 · List products and watch seller_name follow\");"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "04 · Product  (:8082)",
+      "description": "**EN** — The catalogue. Reads are **public** and cached in Redis; writes need a token and\na shop.\n\n⚠️ Run folder 03 first, and give it a moment: this service learns who owns what\nfrom the seller event stream, so a product create issued in the same second as\nthe shop create can fail with an unknown seller. That is the trade an event\nmakes — eventual consistency in exchange for not calling the other service.\n\n---\n\n**TH** — แคตตาล็อกสินค้า — การอ่านเป็น **public** และ cache ด้วย Redis ส่วนการเขียนต้องมี token และร้าน\n\n⚠️ รัน folder 03 ก่อน แล้วรอสักครู่ เพราะ service นี้รู้ว่าใครเป็นเจ้าของร้านจาก event stream\nถ้าสร้างสินค้าในวินาทีเดียวกับที่สร้างร้าน อาจ fail เพราะยังไม่รู้จัก seller\nนี่คือสิ่งที่แลกมากับการใช้ event — eventual consistency แลกกับการไม่ต้องเรียก service อื่น",
+      "item": [
+        {
+          "name": "List products (public, cached)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{productBase}}/api/v1/products?limit=20&offset=0",
+              "host": [
+                "{{productBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            },
+            "description": "**EN** — **No token.** A catalogue that requires a login is a catalogue nobody browses.\n\nReads go through a Redis cache implemented as a **decorator over the repository\nport**, not as a branch inside the service — so the service is written as though\nno cache exists, and removing it is one line in `main`. Measured under k6: the\ncache moves throughput by 3% while taking MongoDB from 685,062 reads to 4. Add a\ncache to protect a dependency, not to lower latency.\n\n---\n\n**TH** — **ไม่ต้องใช้ token** — แคตตาล็อกที่บังคับล็อกอินคือแคตตาล็อกที่ไม่มีใครเข้าดู\n\nการอ่านผ่าน Redis cache ที่ทำเป็น **decorator ครอบ repository port** ไม่ใช่ if-else ใน service\nดังนั้น service เขียนเหมือนไม่มี cache อยู่เลย และถ้าจะเอา cache ออกก็แก้บรรทัดเดียวใน `main`\nวัดด้วย k6 แล้ว: cache เพิ่ม throughput แค่ 3% แต่ลดการอ่าน MongoDB จาก 685,062 ครั้ง เหลือ 4 ครั้ง\nสรุปคือใส่ cache เพื่อปกป้อง dependency ไม่ใช่เพื่อลด latency",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "",
+                  "// Seed productId only if nothing has claimed it yet, so someone can jump",
+                  "// straight to folder 05. Overwriting it unconditionally would point the write",
+                  "// requests at whatever product happens to be first — quite possibly another",
+                  "// seller's, which then answers 403 and looks like an auth bug.",
+                  "const products = pm.response.json().products;",
+                  "if (products && products.length && !pm.collectionVariables.get(\"productId\")) {",
+                  "  pm.collectionVariables.set(\"productId\", products[0].id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List a shop's products",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{productBase}}/api/v1/products?seller_id={{sellerId}}&limit=20",
+              "host": [
+                "{{productBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "seller_id",
+                  "value": "{{sellerId}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "**EN** — Filtered by shop. Paged lists are deliberately **not** cached: every filter and\npage combination is a separate key, and a single write would have to invalidate\nan unknown number of them.\n\n---\n\n**TH** — กรองตามร้าน — รายการที่แบ่งหน้า **ไม่** ถูก cache โดยตั้งใจ เพราะทุกชุด filter\nและทุกหน้าคือ key คนละอัน การเขียนครั้งเดียวจะต้องล้าง key จำนวนที่ไม่รู้ล่วงหน้า",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Wait for the seller event to reach Product",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{productBase}}/healthz",
+              "host": [
+                "{{productBase}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "description": "**EN** — Not an endpoint worth studying — it is a two-second pause with a health check\nattached, so that the next request does not race an event.\n\n**Why a fixed wait and not a poll:** nothing exposes the contents of Product's\nseller read model, and adding an endpoint purely so a test could watch it would\nbe letting the test design the API. Measured propagation on this stack is about\n600ms; two seconds is generous against that.\n\nIf you are clicking through by hand, skip it — you are slower than this\nalready. If a create still answers **409 unknown seller**, that is the race, not\na bug: the Product service returns 409 rather than 404 precisely because\nretrying is the right response.\n\n---\n\n**TH** — ไม่ใช่ endpoint ที่ต้องศึกษาอะไร — มันคือการหน่วงเวลา 2 วินาที ที่มี health check ติดมาด้วย\nเพื่อไม่ให้ request ถัดไปแข่งกับ event\n\n**ทำไมใช้การรอแบบตายตัว ไม่ใช่ poll:** ไม่มี endpoint ไหนเปิดเผยเนื้อใน read model\nของ seller ฝั่ง Product เลย และการเพิ่ม endpoint ขึ้นมาเพียงเพื่อให้ test เฝ้าดูได้\nเท่ากับปล่อยให้ test มาออกแบบ API วัดเวลาการกระจาย event บน stack นี้ได้ประมาณ 600ms\nสองวินาทีจึงเผื่อไว้พอสมควร\n\nถ้าคลิกเล่นเองทีละอัน ข้ามอันนี้ไปได้เลย เพราะมนุษย์ช้ากว่านี้อยู่แล้ว\nและถ้าสร้างสินค้าแล้วยังได้ **409 unknown seller** นั่นคือการแข่งกันของ event ไม่ใช่ bug\nProduct ตอบ 409 แทน 404 ก็เพราะการลองใหม่คือสิ่งที่ควรทำ",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A flat wait, and it is worth saying why rather than dressing it up as a poll.",
+                  "//",
+                  "// Product learns who owns which shop from the seller event stream, so a create",
+                  "// issued in the same second as the shop create can arrive before the seller",
+                  "// does. There is no endpoint that exposes the contents of that read model — and",
+                  "// adding one purely so a test could watch it would be letting the test design",
+                  "// the API — so there is nothing to poll for. A bounded wait is the honest",
+                  "// option.",
+                  "//",
+                  "// Measured propagation on the compose stack: ~600ms. Two seconds is generous",
+                  "// against that, and the cost is paid once per run.",
+                  "//",
+                  "// Delete this request entirely if you are clicking through by hand: a human",
+                  "// takes longer than this between two clicks.",
+                  "const until = Date.now() + 2000;",
+                  "setTimeout(function () {}, 2000);",
+                  "while (Date.now() < until) { /* hold the script open for the wait */ }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List a product → captures productId",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{productBase}}/api/v1/products",
+              "host": [
+                "{{productBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "products"
+              ]
+            },
+            "description": "**EN** — Creates a listing under the caller's shop.\n\n`price_minor` is **25000 satang = ฿250.00** — money is an integer count of minor\nunits plus a currency code, never a float. `0.1 + 0.2` is not `0.3` in binary\nfloating point, and a rounding error in a price is a rounding error in somebody's\nbank balance.\n\nThe shop's name is denormalised onto the product from the local read model, which\nis why folder 03's rename propagates here.\n\n---\n\n**TH** — สร้างรายการสินค้าใต้ร้านของผู้เรียก\n\n`price_minor` คือ **25000 สตางค์ = ฿250.00** — เงินเก็บเป็นจำนวนเต็มของหน่วยย่อย\nบวกรหัสสกุลเงิน ไม่ใช่ float เด็ดขาด เพราะ `0.1 + 0.2` ไม่เท่ากับ `0.3` ใน binary floating point\nและ error จากการปัดเศษในราคา ก็คือ error ในยอดเงินของใครบางคน\n\nชื่อร้านถูก denormalise ลงบนสินค้าจาก read model ในเครื่อง ซึ่งเป็นเหตุผลที่\nการเปลี่ยนชื่อร้านใน folder 03 ไหลมาถึงตรงนี้",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Blue Ceramic Mug\",\n  \"description\": \"320ml, dishwasher safe\",\n  \"price_minor\": 25000,\n  \"currency\": \"THB\",\n  \"stock\": 12\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 — if this is 409, run the wait step above first\", () =>",
+                  "  pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set(\"productId\", body.id);",
+                  "pm.test(\"carries the shop name\", () => pm.expect(body.seller_name).to.be.a(\"string\"));",
+                  "pm.test(\"money is an integer\", () => pm.expect(body.price_minor).to.eql(25000));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get one product (public)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{productBase}}/api/v1/products/{{productId}}",
+              "host": [
+                "{{productBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "products",
+                "{{productId}}"
+              ]
+            },
+            "description": "**EN** — Single-product reads **are** cached, keyed by ID. Run it twice and check the\ncounter: `curl -s localhost:6062/metrics | grep product_cache_lookups_total`.\nEvery cache here exports a hit/miss counter, because a hit rate nobody can see\nis a guess.\n\n---\n\n**TH** — การอ่านสินค้าทีละชิ้น **ถูก cache** โดยใช้ ID เป็น key ลองรันสองครั้งแล้วดูตัวนับ:\n`curl -s localhost:6062/metrics | grep product_cache_lookups_total`\nทุก cache ในระบบนี้ส่งออกตัวนับ hit/miss เพราะ hit rate ที่ไม่มีใครมองเห็นคือการเดา",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Change price or stock (PATCH)",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{productBase}}/api/v1/products/{{productId}}",
+              "host": [
+                "{{productBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "products",
+                "{{productId}}"
+              ]
+            },
+            "description": "**EN** — Owner only — somebody else's product answers **403**.\n\nA write **invalidates** its cache key; it does not rewrite it. Rewriting lets two\nracing writers leave the older value cached indefinitely, and invalidation is\nexact rather than a scan: the repository returns the affected IDs so the\ndecorator deletes those keys. Scanning Redis for keys that might match is\n`O(keyspace)`.\n\n---\n\n**TH** — เฉพาะเจ้าของ — สินค้าของคนอื่นจะได้ **403**\n\nการเขียนจะ **ล้าง (invalidate)** cache key ไม่ใช่เขียนทับ เพราะถ้าเขียนทับ\nเมื่อมีคนเขียนพร้อมกันสองคน ค่าเก่ากว่าอาจค้างอยู่ใน cache ตลอดไป\nและการล้างทำแบบเจาะจง ไม่ใช่การ scan: repository คืน ID ที่ได้รับผลกระทบมาให้\ndecorator ลบเฉพาะ key เหล่านั้น การ scan Redis หา key ที่อาจตรงคือ `O(keyspace)`",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"price_minor\": 19900,\n  \"stock\": 25\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"price changed\", () => pm.expect(pm.response.json().price_minor).to.eql(19900));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "05 · Order  (:8083)  — the saga",
+      "description": "**EN** — The most interesting folder. Placing an order spans two services with two\nseparate databases, so there is no transaction available: it is a **saga** —\nreserve stock over gRPC, write the order, compensate if anything fails.\n\nOpen Jaeger (http://localhost:16686) before running \"Place an order\", then look\nat the trace afterwards.\n\n---\n\n**TH** — folder ที่น่าสนใจที่สุด — การสั่งซื้อพาดผ่านสอง service ที่มีคนละ database\nจึงไม่มี transaction ให้ใช้ ต้องใช้ **saga**: จอง stock ผ่าน gRPC, เขียน order,\nแล้วชดเชย (compensate) ถ้าขั้นไหนพัง\n\nเปิด Jaeger (http://localhost:16686) ก่อนรัน \"Place an order\" แล้วค่อยกลับไปดู trace",
+      "item": [
+        {
+          "name": "Place an order → captures orderId",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orderBase}}/api/v1/orders",
+              "host": [
+                "{{orderBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "**EN** — The whole system in one request. What happens, in order:\n\n1. **Reserve stock** on the Product service over **gRPC**, secured by **mutual\n   TLS** — not a bearer token, because there is no user in this call. The\n   question is *which service is asking*, and only a client certificate answers\n   that. This is the only synchronous call between services in the entire\n   system; everything else is an event. It is synchronous because a buyer cannot\n   be told their order exists until the stock is actually secured.\n2. **Write the order and its event in one transaction**, using the outbox.\n3. **Confirm the reservation**, so the reaper leaves it alone.\n\nThe reservation itself is a single **atomic conditional update** —\n`{_id, stock: {$gte: n}}` with `$inc` — so two buyers racing for the last unit\ncannot both succeed. No lock, no read-then-write.\n\n`Idempotency-Key` is **required**. A caller that times out cannot tell whether\nthe server acted, so it will retry; the key is what makes that retry safe rather\nthan turning \"reserve stock\" into \"reserve stock twice\".\n\n---\n\n**TH** — ทั้งระบบอยู่ใน request เดียว — ลำดับที่เกิดขึ้น:\n\n1. **จอง stock** ที่ Product service ผ่าน **gRPC** ที่ป้องกันด้วย **mutual TLS**\n   ไม่ใช่ bearer token เพราะ call นี้ไม่มี user อยู่เลย คำถามคือ *service ไหนเป็นคนถาม*\n   ซึ่งมีแต่ client certificate ที่ตอบได้ นี่เป็น synchronous call เดียวระหว่าง service\n   ในระบบทั้งหมด ที่เหลือเป็น event หมด — ที่ต้อง synchronous เพราะจะบอกผู้ซื้อว่า\n   order สำเร็จไม่ได้ จนกว่าจะจอง stock ได้จริง\n2. **เขียน order และ event ของมันใน transaction เดียว** ผ่าน outbox\n3. **ยืนยันการจอง (Confirm)** เพื่อให้ reaper ไม่มาเก็บกวาดคืน\n\nตัวการจอง stock เองคือ **atomic conditional update** ครั้งเดียว —\n`{_id, stock: {$gte: n}}` คู่กับ `$inc` — ทำให้ผู้ซื้อสองคนที่แย่งชิ้นสุดท้าย\nสำเร็จพร้อมกันไม่ได้ ไม่ต้องใช้ lock ไม่ต้อง read-then-write\n\n`Idempotency-Key` เป็น **ของบังคับ** — caller ที่ timeout ไม่มีทางรู้ว่า server ทำไปแล้วหรือยัง\nมันจึงจะ retry และ key นี้คือสิ่งที่ทำให้ retry ปลอดภัย ไม่ให้ \"จอง stock\"\nกลายเป็น \"จอง stock สองรอบ\"",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"items\": [\n    { \"product_id\": \"{{productId}}\", \"quantity\": 3 }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A new key per run. Re-send the SAME key with the next request to see the",
+                  "// replay path instead of a second order.",
+                  "pm.collectionVariables.set(\"idempotencyKey\", \"postman-\" + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 Created\", () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set(\"orderId\", body.id);",
+                  "pm.test(\"starts pending\", () => pm.expect(body.status).to.eql(\"pending\"));",
+                  "pm.test(\"priced from the product, not from the client\", () =>",
+                  "  pm.expect(body.total_minor).to.be.a(\"number\"));",
+                  "console.log(\"order \" + body.id + \" — now look at the trace in Jaeger\");"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Replay the SAME key (idempotency)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orderBase}}/api/v1/orders",
+              "host": [
+                "{{orderBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "**EN** — Deliberately **no** pre-request script, so this reuses the key from the previous\nrequest — exactly what a retrying client does after a timeout.\n\nExpect the **same order back**, and check \"List products\": the stock must have\ngone down **once**, not twice. Without the key this is how a flaky network turns\ninto double-charged customers.\n\nThere is a subtlety worth knowing: the duplicate check happens **outside** the\nMongoDB transaction. Catching the duplicate-key error inside it and returning\nsuccess asks the driver to commit a transaction that already contains a failed\nwrite — the commit fails with a retryable label, the driver retries, the\nduplicate is still there, and the call spins until its context expires. That bug\nhung a test for 90 seconds; moving the check outside took it to 0.05s.\n\n---\n\n**TH** — ตั้งใจ **ไม่ใส่** pre-request script เพื่อให้ใช้ key เดิมจาก request ก่อนหน้า —\nซึ่งคือสิ่งที่ client ทำเป๊ะ ๆ เวลา retry หลัง timeout\n\nควรได้ **order เดิมกลับมา** และลองเช็ค \"List products\" ดู: stock ต้องลด **ครั้งเดียว**\nไม่ใช่สองครั้ง ถ้าไม่มี key นี้ เน็ตที่ไม่เสถียรจะกลายเป็นลูกค้าโดนตัดเงินซ้ำ\n\nมีรายละเอียดที่ควรรู้: การเช็คว่าซ้ำเกิดขึ้น **นอก** MongoDB transaction\nถ้าดัก duplicate-key error ไว้ข้างในแล้วคืน success เท่ากับสั่งให้ driver commit\ntransaction ที่มี write ที่ fail อยู่ข้างในแล้ว — commit จะ fail แบบ retryable\ndriver จะ retry ตัวซ้ำก็ยังอยู่ วนแบบนี้จน context หมดอายุ\nbug นี้เคยทำให้ test ค้าง 90 วินาที พอย้ายการเช็คออกมาข้างนอกเหลือ 0.05 วินาที",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"items\": [\n    { \"product_id\": \"{{productId}}\", \"quantity\": 3 }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 or 201 — never a second order\", () =>",
+                  "  pm.expect(pm.response.code).to.be.oneOf([200, 201]));",
+                  "pm.test(\"returns the SAME order\", () =>",
+                  "  pm.expect(pm.response.json().id).to.eql(pm.collectionVariables.get(\"orderId\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "My orders",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{orderBase}}/api/v1/orders?limit=20&offset=0",
+              "host": [
+                "{{orderBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            },
+            "description": "**EN** — Scoped to the token's subject. There is no \"all orders\" endpoint — a buyer\ncannot ask for somebody else's list by omitting a filter.\n\n---\n\n**TH** — จำกัดเฉพาะ subject ของ token — ไม่มี endpoint \"order ทั้งหมด\"\nผู้ซื้อจึงขอรายการของคนอื่นด้วยการไม่ใส่ filter ไม่ได้"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get one order",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{orderBase}}/api/v1/orders/{{orderId}}",
+              "host": [
+                "{{orderBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "{{orderId}}"
+              ]
+            },
+            "description": "**EN** — Buyer only. Somebody else's order answers 403, not 404.\n\n---\n\n**TH** — เฉพาะผู้ซื้อ — order ของคนอื่นได้ 403 ไม่ใช่ 404"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pay  (stock stays gone)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{orderBase}}/api/v1/orders/{{orderId}}/pay",
+              "host": [
+                "{{orderBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "{{orderId}}",
+                "pay"
+              ]
+            },
+            "description": "**EN** — Moves the order to `paid`. The reserved stock stays reserved, which is the\npoint: the sale completed.\n\nPay and Cancel are the two endings of the saga, and an order only gets one — so\nthe Cancel request below places its own order rather than trying to cancel this\none, which would be a 409.\n\n---\n\n**TH** — เปลี่ยนสถานะ order เป็น `paid` — stock ที่จองไว้ยังคงถูกจองต่อไป ซึ่งถูกต้อง\nเพราะการขายสำเร็จแล้ว\n\nPay กับ Cancel คือปลายทางสองแบบของ saga และ order หนึ่งใบมีปลายทางได้แบบเดียว\nดังนั้น request Cancel ข้างล่างจะสั่งซื้อใบใหม่ของตัวเอง แทนที่จะมายกเลิกใบนี้ ซึ่งจะได้ 409"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"paid\", () => pm.expect(pm.response.json().status).to.eql(\"paid\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cancel  (stock comes back)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{orderBase}}/api/v1/orders/{{cancelOrderId}}/cancel",
+              "host": [
+                "{{orderBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "{{cancelOrderId}}",
+                "cancel"
+              ]
+            },
+            "description": "**EN** — The **compensating action** of the saga: it releases the reservation and the\nstock returns. Check \"List products\" before and after.\n\nThe pre-request script places a fresh order to cancel, because the previous\nrequest already paid for the other one — this way both endings run in a single\nRunner pass without either being a lie.\n\nCompensation must be safe to call repeatedly, because it runs on exactly the\npath where retries happen — so releasing an unknown key, or one already\nreleased, returns success rather than an error. Refusing a repeat here would\nturn a recoverable situation into a stuck one.\n\n---\n\n**TH** — คือ **compensating action** ของ saga — ปล่อยการจองแล้ว stock กลับคืน\nลองเช็ค \"List products\" ก่อนและหลังดู\n\npre-request script จะสั่งซื้อใบใหม่ขึ้นมาเพื่อยกเลิก เพราะ request ก่อนหน้าจ่ายเงินใบเดิมไปแล้ว\nวิธีนี้ทำให้ปลายทางทั้งสองแบบรันได้ครบในรอบเดียว โดยไม่มีอันไหนเป็นการโกหก\n\nการชดเชยต้องเรียกซ้ำได้อย่างปลอดภัย เพราะมันทำงานบนเส้นทางที่มีการ retry อยู่แล้ว\nดังนั้นการปล่อย key ที่ไม่รู้จัก หรือ key ที่ปล่อยไปแล้ว จะคืน success ไม่ใช่ error\nถ้าปฏิเสธการเรียกซ้ำตรงนี้ สถานการณ์ที่กู้คืนได้จะกลายเป็นค้างถาวร"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Place a throwaway order to cancel, rather than cancelling the one Pay just",
+                  "// settled. Both are real endings of the saga and both deserve a demonstration,",
+                  "// but an order can only have one ending — cancelling a paid order is a 409, and",
+                  "// correctly so.",
+                  "const base = pm.variables.replaceIn(\"{{orderBase}}\");",
+                  "const token = pm.variables.replaceIn(\"{{token}}\");",
+                  "const productId = pm.variables.replaceIn(\"{{productId}}\");",
+                  "",
+                  "pm.sendRequest({",
+                  "  url: base + \"/api/v1/orders\",",
+                  "  method: \"POST\",",
+                  "  header: {",
+                  "    \"Content-Type\": \"application/json\",",
+                  "    \"Authorization\": \"Bearer \" + token,",
+                  "    \"Idempotency-Key\": \"cancel-demo-\" + Date.now()",
+                  "  },",
+                  "  body: { mode: \"raw\", raw: JSON.stringify({ items: [{ product_id: productId, quantity: 1 }] }) }",
+                  "}, function (err, res) {",
+                  "  if (!err && res.code === 201) {",
+                  "    pm.collectionVariables.set(\"cancelOrderId\", res.json().id);",
+                  "    console.log(\"placed \" + res.json().id + \" so there is something to cancel\");",
+                  "  } else {",
+                  "    console.log(\"could not place an order to cancel: \" + (err || res.code));",
+                  "  }",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"cancelled\", () => pm.expect(pm.response.json().status).to.eql(\"cancelled\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "06 · Marketplace  (:8084)",
+      "description": "**EN** — A search projection fed by **three** event streams — seller, product and order —\nwith its own MongoDB text index and a TTL search cache. It owns no writes at all:\nevery row here is the result of an event somebody else published.\n\n---\n\n**TH** — projection สำหรับค้นหา ที่ถูกป้อนด้วย event **สามสาย** — seller, product และ order\nมี MongoDB text index ของตัวเอง และ search cache แบบ TTL\nservice นี้ไม่มีการเขียนเป็นของตัวเองเลย ทุก row เกิดจาก event ที่ service อื่น publish",
+      "item": [
+        {
+          "name": "Search",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{marketBase}}/api/v1/marketplace/listings?q=mug&limit=20",
+              "host": [
+                "{{marketBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "marketplace",
+                "listings"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "mug"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "**EN** — Public full-text search over a **MongoDB text index** — a real index, not a\nsubstring match, so it stems and ranks rather than merely containing.\n\nResults are cached with a short TTL. A search cache is a ceiling on staleness\nrather than a correctness mechanism: nobody minds a listing appearing a few\nseconds late, and the alternative — invalidating every query that might match a\nchanged product — is not computable.\n\n---\n\n**TH** — ค้นหาแบบ full-text สาธารณะ ผ่าน **MongoDB text index** — เป็น index จริง ๆ\nไม่ใช่การ match substring จึงตัดรากคำและจัดอันดับได้ ไม่ใช่แค่ \"มีคำนี้อยู่\"\n\nผลลัพธ์ถูก cache ด้วย TTL สั้น ๆ — search cache คือเพดานของความเก่า ไม่ใช่กลไกความถูกต้อง\nเพราะไม่มีใครเดือดร้อนถ้าสินค้าโผล่ช้าไปไม่กี่วินาที และทางเลือกอีกทาง คือการล้าง\nทุก query ที่อาจตรงกับสินค้าที่เปลี่ยน ซึ่งคำนวณไม่ได้",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Filter by price and stock",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{marketBase}}/api/v1/marketplace/listings?min_price=10000&max_price=50000&in_stock=true&limit=20",
+              "host": [
+                "{{marketBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "marketplace",
+                "listings"
+              ],
+              "query": [
+                {
+                  "key": "min_price",
+                  "value": "10000"
+                },
+                {
+                  "key": "max_price",
+                  "value": "50000"
+                },
+                {
+                  "key": "in_stock",
+                  "value": "true"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "**EN** — Prices are in **minor units** here too, so this is ฿100.00–฿500.00.\n`in_stock=true` hides sold-out listings.\n\n---\n\n**TH** — ราคาที่นี่ก็เป็น **หน่วยย่อย** เหมือนกัน ดังนั้นช่วงนี้คือ ฿100.00–฿500.00\nส่วน `in_stock=true` จะซ่อนสินค้าที่ของหมด",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Sort by best selling  (order events at work)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{marketBase}}/api/v1/marketplace/listings?sort=best_selling&limit=20",
+              "host": [
+                "{{marketBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "marketplace",
+                "listings"
+              ],
+              "query": [
+                {
+                  "key": "sort",
+                  "value": "best_selling"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "**EN** — `sold_count` is maintained from the **order** stream. Nothing in the Order\nservice knows the Marketplace exists — it publishes what happened, and whoever\ncares subscribes. That is the difference between publishing an event and calling\na list of services: adding a seventh consumer requires no change to any\npublisher.\n\nOther values for `sort`: `relevance`, `newest`, `price_asc`, `price_desc`.\n\n---\n\n**TH** — `sold_count` ถูกอัปเดตจาก stream ของ **order** — โค้ดใน Order service\nไม่รู้จัก Marketplace เลยสักนิด มันแค่ประกาศว่ามีอะไรเกิดขึ้น ใครสนใจก็มา subscribe เอง\nนี่คือความต่างระหว่างการ publish event กับการไล่เรียก service ทีละตัว:\nถ้าจะเพิ่ม consumer ตัวที่เจ็ด ไม่ต้องแก้ publisher เลย\n\nค่าอื่นของ `sort`: `relevance`, `newest`, `price_asc`, `price_desc`",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"echoes the sort it applied\", () =>",
+                  "  pm.expect(pm.response.json().sort).to.eql(\"best_selling\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Filter by shop",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{marketBase}}/api/v1/marketplace/listings?seller_id={{sellerId}}&limit=20",
+              "host": [
+                "{{marketBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "marketplace",
+                "listings"
+              ],
+              "query": [
+                {
+                  "key": "seller_id",
+                  "value": "{{sellerId}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "**EN** — Every listing carries `seller_name`, kept current by the seller stream — so a\nshop rename in folder 03 shows up here too, in a third service that has never\ncalled the second.\n\n---\n\n**TH** — ทุกรายการพก `seller_name` มาด้วย และค่านี้อัปเดตจาก stream ของ seller\nดังนั้นการเปลี่ยนชื่อร้านใน folder 03 จะมาโผล่ที่นี่ด้วย — ใน service ตัวที่สาม\nที่ไม่เคยเรียก service ตัวที่สองเลย",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "07 · Live Commerce  (:8085)",
+      "description": "**EN** — Live selling. Everything shared between viewers lives in **Redis**, not in\nprocess memory, because a WebSocket lives on exactly one instance — and two\ninstances each keeping their own idea of the audience would both be wrong.\n\nRedis is **required** here, unlike in Product where it is only a cache.\n\n---\n\n**TH** — ไลฟ์ขายของ — ทุกอย่างที่ผู้ชมต้องเห็นตรงกันเก็บใน **Redis** ไม่ใช่ใน memory ของ process\nเพราะ WebSocket หนึ่งเส้นอยู่บน instance เดียวเท่านั้น ถ้าสอง instance ต่างคนต่างจำ\nว่าใครดูอยู่บ้าง มันจะผิดทั้งคู่\n\nRedis ที่นี่เป็น **ของบังคับ** ต่างจากใน Product ที่เป็นแค่ cache",
+      "item": [
+        {
+          "name": "Create a stream → captures streamId",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{liveBase}}/api/v1/live/streams",
+              "host": [
+                "{{liveBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "live",
+                "streams"
+              ]
+            },
+            "description": "**EN** — Creates a stream owned by the caller's shop. Requires a shop (folder 03).\n\n---\n\n**TH** — สร้างไลฟ์ที่เป็นของร้านผู้เรียก — ต้องมีร้านก่อน (folder 03)",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"title\": \"Mug launch — Postman run\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"streamId\", pm.response.json().id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Start the stream",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{liveBase}}/api/v1/live/streams/{{streamId}}/start",
+              "host": [
+                "{{liveBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "live",
+                "streams",
+                "{{streamId}}",
+                "start"
+              ]
+            },
+            "description": "**EN** — Host only. Moves it to `live` and stamps `started_at`.\n\n---\n\n**TH** — เฉพาะเจ้าของไลฟ์ — เปลี่ยนสถานะเป็น `live` และบันทึก `started_at`"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Feature a product",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{liveBase}}/api/v1/live/streams/{{streamId}}/feature",
+              "host": [
+                "{{liveBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "live",
+                "streams",
+                "{{streamId}}",
+                "feature"
+              ]
+            },
+            "description": "**EN** — Pins the product every viewer sees, and broadcasts the change to everyone\nalready watching — through **Redis pub/sub**, so viewers connected to a\ndifferent instance get it too.\n\nPub/sub, not Kafka, and deliberately: it has no replay, which is correct for a\nfeed whose value decays in seconds and wrong for anything durable. This is also\nthe one publisher in the system with **no outbox**, for the same reason — a\ndelivery guarantee for a notification that is worthless when stale is machinery\nin service of nothing.\n\n---\n\n**TH** — ปักสินค้าที่ผู้ชมทุกคนเห็น และกระจายการเปลี่ยนแปลงไปยังทุกคนที่ดูอยู่แล้ว\nผ่าน **Redis pub/sub** ผู้ชมที่ต่ออยู่คนละ instance ก็ได้รับด้วย\n\nใช้ pub/sub ไม่ใช่ Kafka และตั้งใจแบบนั้น — มันไม่มี replay ซึ่งถูกต้องสำหรับ feed\nที่มูลค่าหมดไปในไม่กี่วินาที และผิดสำหรับอะไรที่ต้องคงทน นี่ยังเป็น publisher เดียว\nในระบบที่ **ไม่มี outbox** ด้วยเหตุผลเดียวกัน — การรับประกันการส่งมอบ ของการแจ้งเตือน\nที่ไร้ค่าเมื่อมันเก่า คือกลไกที่สร้างมาเพื่อความว่างเปล่า",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"product_id\": \"{{productId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List live streams (public)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{liveBase}}/api/v1/live/streams?limit=20",
+              "host": [
+                "{{liveBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "live",
+                "streams"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "**EN** — Public. No token needed to browse what is on air.\n\n---\n\n**TH** — สาธารณะ — ไม่ต้องมี token ก็ดูได้ว่ามีไลฟ์อะไรอยู่บ้าง",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get one stream (public)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{liveBase}}/api/v1/live/streams/{{streamId}}",
+              "host": [
+                "{{liveBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "live",
+                "streams",
+                "{{streamId}}"
+              ]
+            },
+            "description": "**EN** — Includes the current viewer count, read from a Redis sorted set scored by\ntimestamp. **Presence expires**: nobody sends a goodbye when a laptop lid\ncloses, so viewers are pruned on read and the socket heartbeats to stay\ncounted.\n\n---\n\n**TH** — มีจำนวนผู้ชมปัจจุบันด้วย อ่านจาก Redis sorted set ที่ให้คะแนนด้วย timestamp\n**presence ต้องหมดอายุได้**: ไม่มีใครส่งคำว่าลาก่อนตอนปิดฝาโน้ตบุ๊ก\nดังนั้นผู้ชมจะถูกตัดออกตอนอ่าน และ socket ต้องส่ง heartbeat เพื่อให้ยังถูกนับอยู่",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "End the stream",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{liveBase}}/api/v1/live/streams/{{streamId}}/end",
+              "host": [
+                "{{liveBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "live",
+                "streams",
+                "{{streamId}}",
+                "end"
+              ]
+            },
+            "description": "**EN** — Host only. Stamps `ended_at` and closes the room.\n\n---\n\n**TH** — เฉพาะเจ้าของไลฟ์ — บันทึก `ended_at` และปิดห้อง"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Watch  (WebSocket — read the note)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{liveBase}}/api/v1/live/streams/{{streamId}}/watch",
+              "host": [
+                "{{liveBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "live",
+                "streams",
+                "{{streamId}}",
+                "watch"
+              ]
+            },
+            "description": "**EN** — ⚠️ **This is a WebSocket upgrade and will NOT work as a plain HTTP request.**\nSending it here returns 400 or 426; that is correct, not a bug.\n\nTo actually watch, use Postman's own **WebSocket request** type (New → WebSocket)\nand connect to:\n\n    ws://localhost:8085/api/v1/live/streams/{{streamId}}/watch\n\nThe server reads from the socket even when the client sends nothing, because a\nWebSocket close only surfaces through a read — a handler that never reads never\nlearns the viewer left. Frames are dropped for a slow viewer rather than\nblocking, so one stalled connection cannot hold up everyone sharing the\nprocess.\n\n---\n\n**TH** — ⚠️ **นี่คือ WebSocket upgrade ยิงเป็น HTTP ธรรมดาไม่ได้**\nถ้ายิงจากตรงนี้จะได้ 400 หรือ 426 ซึ่งถูกต้องแล้ว ไม่ใช่ bug\n\nถ้าอยากดูจริง ให้ใช้ request แบบ **WebSocket** ของ Postman (New → WebSocket) แล้วต่อไปที่:\n\n    ws://localhost:8085/api/v1/live/streams/{{streamId}}/watch\n\nฝั่ง server จะอ่านจาก socket ตลอด แม้ client ไม่ส่งอะไรมาเลย เพราะการปิด WebSocket\nจะรู้ได้จากการอ่านเท่านั้น — handler ที่ไม่เคยอ่านจะไม่มีวันรู้ว่าผู้ชมออกไปแล้ว\nและถ้าผู้ชมคนไหนช้า จะ drop frame ทิ้งแทนที่จะ block เพื่อไม่ให้การเชื่อมต่อที่ค้างอยู่หนึ่งเส้น\nฉุดทุกคนที่ใช้ process เดียวกัน",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"not an HTTP endpoint — use a WebSocket request instead\", () =>",
+                  "  pm.expect(pm.response.code).to.be.oneOf([400, 426, 200]));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "08 · Failure modes  (the ones worth checking)",
+      "description": "**EN** — Every request here is **supposed** to fail, and the assertion is on *how*. An API\nis defined as much by its error paths as its happy ones — and \"returns 500\" is\nnot an error path, it is an absent one.\n\n---\n\n**TH** — ทุก request ในนี้ **ตั้งใจให้ fail** และสิ่งที่ตรวจคือ *fail อย่างไร*\nAPI ถูกนิยามด้วยเส้นทาง error ไม่แพ้เส้นทางปกติ — และ \"คืน 500\" ไม่ใช่เส้นทาง error\nแต่คือการไม่มีเส้นทางนั้นเลย",
+      "item": [
+        {
+          "name": "No token → 401",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{userBase}}/api/v1/users",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users"
+              ]
+            },
+            "description": "**EN** — 401, not 500. A missing credential is a client problem with a name.\n\n---\n\n**TH** — ต้องเป็น 401 ไม่ใช่ 500 — การไม่มี credential คือปัญหาฝั่ง client ที่มีชื่อเรียกของมัน",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Garbage token → 401",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer not-a-jwt-at-all"
+              }
+            ],
+            "url": {
+              "raw": "{{userBase}}/api/v1/users",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users"
+              ]
+            },
+            "description": "**EN** — Also 401. Verification pins the signing algorithm with `WithValidMethods`\nbefore trusting any claim — without that, a token declaring `none` is accepted\nwith no signature at all, and one declaring `RS256` can be signed using the\n*public* key as an HMAC secret. There is a Go test for both attacks.\n\n---\n\n**TH** — ได้ 401 เช่นกัน — การ verify จะล็อก algorithm ด้วย `WithValidMethods`\nก่อนจะเชื่อ claim ใด ๆ ถ้าไม่ทำ token ที่ประกาศว่า `none` จะผ่านโดยไม่มีลายเซ็นเลย\nและ token ที่ประกาศ `RS256` สามารถถูกเซ็นด้วย public key ในฐานะ HMAC secret ได้\nมี Go test ครอบทั้งสองการโจมตีนี้อยู่",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Duplicate email → 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{userBase}}/api/v1/auth/register",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "register"
+              ]
+            },
+            "description": "**EN** — 409 Conflict, raised by the **MongoDB unique index** rather than by a\nread-then-write check. Run folder 01 first so the address exists.\n\nThe distinction matters under load: a check-then-insert has a window between the\ntwo, and two concurrent registrations both read \"available\" and both insert. The\nindex has no window — the second insert simply cannot succeed.\n\n---\n\n**TH** — 409 Conflict ที่เกิดจาก **unique index ของ MongoDB** ไม่ใช่จากการเช็คก่อนเขียน\nต้องรัน folder 01 ก่อนเพื่อให้อีเมลนี้มีอยู่จริง\n\nความต่างนี้สำคัญตอนโหลดเยอะ: การเช็คแล้วค่อย insert มีช่องว่างระหว่างสองขั้นตอน\nถ้าสมัครพร้อมกันสองคน ทั้งคู่จะอ่านได้ว่า \"ว่าง\" แล้ว insert ทั้งคู่\nส่วน index ไม่มีช่องว่างนั้น — insert ตัวที่สองสำเร็จไม่ได้เลย",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Duplicate\",\n  \"email\": \"{{email}}\",\n  \"password\": \"correct-horse-battery-staple\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 Conflict\", () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Validation → 400 with per-field detail",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{userBase}}/api/v1/auth/register",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "register"
+              ]
+            },
+            "description": "**EN** — 400, never 500, and the body names **every** offending field at once rather\nthan the first one — so a form can highlight all of them in a single round trip:\n\n```json\n{\"error\":\"validation failed\",\"fields\":{\"email\":\"must be a valid email address\"}}\n```\n\n---\n\n**TH** — ต้องเป็น 400 ไม่ใช่ 500 และ body จะบอก **ทุก** field ที่ผิดพร้อมกัน\nไม่ใช่แค่ตัวแรก เพื่อให้ฟอร์มไฮไลต์ได้ครบในรอบเดียว:\n\n```json\n{\"error\":\"validation failed\",\"fields\":{\"email\":\"must be a valid email address\"}}\n```",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"\",\n  \"email\": \"not-an-email\",\n  \"password\": \"short\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"names the offending fields\", () =>",
+                  "  pm.expect(pm.response.json()).to.have.property(\"fields\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Malformed JSON → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{userBase}}/api/v1/auth/register",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "register"
+              ]
+            },
+            "description": "**EN** — 400, never 500. A body the client got wrong is a client error, and answering\n500 tells the caller to retry something that will never work.\n\n---\n\n**TH** — ต้องเป็น 400 ไม่ใช่ 500 — body ที่ client ส่งผิดคือความผิดฝั่ง client\nการตอบ 500 เท่ากับบอก caller ให้ retry สิ่งที่ยังไงก็ไม่มีวันสำเร็จ",
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"name\": \"broken\", ",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 — not 500\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Malformed ID → 400",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{userBase}}/api/v1/users/not-an-object-id",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "not-an-object-id"
+              ]
+            },
+            "description": "**EN** — Not a MongoDB ObjectID at all, so the request itself is malformed: **400**.\n\n---\n\n**TH** — ไม่ใช่ MongoDB ObjectID เลย แปลว่า request ผิดรูปแบบตั้งแต่ต้น: **400**"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Well-formed but absent ID → 404",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{userBase}}/api/v1/users/000000000000000000000001",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "000000000000000000000001"
+              ]
+            },
+            "description": "**EN** — A valid ObjectID that names nothing: **404**. Same shape of URL as the previous\nrequest, different failure — which is precisely why they must not share a status\ncode.\n\n---\n\n**TH** — ObjectID ที่ถูกต้องแต่ไม่ชี้ไปที่อะไร: **404** — หน้าตา URL เหมือน request ก่อนหน้า\nแต่คนละความผิดพลาด ซึ่งเป็นเหตุผลตรง ๆ ว่าทำไมสองอันนี้ต้องไม่ใช้ status code เดียวกัน"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Somebody else's account → 403",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{userBase}}/api/v1/users/000000000000000000000001",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "000000000000000000000001"
+              ]
+            },
+            "description": "**EN** — **403**, under the authorization model in `docs/user-domain-design.md`: reads are\nopen to any authenticated caller, but PATCH and DELETE are restricted to the\ntoken's own subject. The brief's entity has no role field, so there is no\nadministrator to grant wider rights to — inventing one would be inventing a\nrequirement.\n\n---\n\n**TH** — **403** ตามโมเดลสิทธิ์ใน `docs/user-domain-design.md`: การอ่านเปิดให้ทุกคนที่ล็อกอิน\nแต่ PATCH และ DELETE จำกัดเฉพาะเจ้าของ token — entity ตามโจทย์ไม่มี field role\nจึงไม่มีผู้ดูแลระบบให้มอบสิทธิ์ที่กว้างกว่านี้ การไปสร้างขึ้นมาเองเท่ากับสร้างความต้องการที่ไม่มีใครขอ",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Not Mine\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"403 — not 404\", () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Order without Idempotency-Key → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orderBase}}/api/v1/orders",
+              "host": [
+                "{{orderBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "**EN** — The header is required, and its absence is refused up front rather than\ntolerated. Every cross-service write takes one: a caller that times out cannot\ntell whether the server acted, so it will retry, and without a key the retry is\na second reservation.\n\n---\n\n**TH** — header นี้เป็นของบังคับ และถ้าไม่มีจะถูกปฏิเสธตั้งแต่ต้น ไม่ใช่ปล่อยผ่าน\nทุกการเขียนข้าม service ต้องมี key นี้ — caller ที่ timeout ไม่รู้ว่า server ทำไปหรือยัง\nมันจะ retry และถ้าไม่มี key การ retry นั้นคือการจอง stock รอบที่สอง",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"items\": [\n    { \"product_id\": \"{{productId}}\", \"quantity\": 1 }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Order more than exists → 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "oversell-{{$timestamp}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orderBase}}/api/v1/orders",
+              "host": [
+                "{{orderBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "**EN** — Insufficient stock. The reservation is a conditional update\n(`{stock: {$gte: n}}`), so this fails at the database rather than after a read\nthat could already be stale — and the order is never created, so there is nothing\nto compensate.\n\n---\n\n**TH** — stock ไม่พอ — การจองเป็น conditional update (`{stock: {$gte: n}}`)\nมันจึง fail ที่ database เลย ไม่ใช่ fail หลังจากอ่านค่ามาแล้วซึ่งอาจเก่าไปแล้ว\nและ order ไม่ถูกสร้างขึ้นเลย จึงไม่มีอะไรต้องชดเชย",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"items\": [\n    { \"product_id\": \"{{productId}}\", \"quantity\": 999999 }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"409 or 422\", () =>",
+                  "  pm.expect(pm.response.code).to.be.oneOf([409, 422, 400]));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "09 · Tracing",
+      "description": "**EN** — Prove the trace crosses services, from Postman. Open http://localhost:16686\nalongside.\n\n---\n\n**TH** — พิสูจน์ว่า trace ข้าม service ได้จริง จาก Postman — เปิด http://localhost:16686 ควบคู่ไปด้วย",
+      "item": [
+        {
+          "name": "Send your own traceparent",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "traceparent",
+                "value": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+              }
+            ],
+            "url": {
+              "raw": "{{orderBase}}/healthz",
+              "host": [
+                "{{orderBase}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "description": "**EN** — This is the whole contract in one request: a trace started somewhere else — an\nAPI gateway, a mobile client, another team's service — is **continued** here\nrather than replaced.\n\nThen look for it:\n\n```bash\nmake docker-logs SERVICE=order | grep 4bf92f3577b34da6a3ce929d0e0e4736\n```\n\nEvery log line carries `trace_id` and `span_id`, added in the same slog handler\nthat adds `request_id` — so a bad line found in the logs and the whole\ndistributed request are one paste apart.\n\n---\n\n**TH** — นี่คือสัญญาทั้งหมดในหนึ่ง request: trace ที่เริ่มจากที่อื่น — API gateway,\nmobile client หรือ service ของทีมอื่น — จะถูก **สานต่อ** ที่นี่ ไม่ใช่ถูกแทนที่\n\nแล้วลองหาดู:\n\n```bash\nmake docker-logs SERVICE=order | grep 4bf92f3577b34da6a3ce929d0e0e4736\n```\n\nทุกบรรทัด log พก `trace_id` และ `span_id` มาด้วย ซึ่งเติมโดย slog handler ตัวเดียวกับ\nที่เติม `request_id` — บรรทัดที่มีปัญหาใน log กับ request ทั้งเส้นข้าม service\nจึงห่างกันแค่การ copy-paste ครั้งเดียว",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Place an order, then read the trace",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "traced-{{$timestamp}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orderBase}}/api/v1/orders",
+              "host": [
+                "{{orderBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "**EN** — Run this, then open Jaeger → **Service: order** → **Operation:\n`POST /api/v1/orders/`** → Find Traces. One trace, seven spans, three services:\n\n```\norder        POST /api/v1/orders/                62.51ms\n └ order     product.v1.StockService/Reserve     22.12ms\n    └ product  product.v1.StockService/Reserve   13.08ms\n └ order     product.v1.StockService/Confirm      5.14ms\n    └ product  product.v1.StockService/Confirm    4.13ms\n └ order     outbox publish order.events         30.38ms\n    └ marketplace  consume order.events            193µs\n```\n\nThe last two lines are the ones that took the work. The publish did **not**\nhappen during the request — the request wrote the event into the outbox inside\nits transaction and returned, and a background relay published it afterwards.\nThe trace context is stored in the outbox row and replayed by the relay, so the\nevent and the checkout that caused it are one trace instead of two unrelated log\nstreams and a timestamp comparison.\n\nSpan names are route patterns (`POST /api/v1/orders/`), never raw paths — the\nsame cardinality rule the Prometheus labels follow, and the reason the HTTP\ninstrumentation here is hand-written instead of `otelhttp`.\n\n---\n\n**TH** — รันอันนี้ แล้วเปิด Jaeger → **Service: order** → **Operation:\n`POST /api/v1/orders/`** → Find Traces จะได้ 1 trace, 7 spans, 3 services:\n\n```\norder        POST /api/v1/orders/                62.51ms\n └ order     product.v1.StockService/Reserve     22.12ms\n    └ product  product.v1.StockService/Reserve   13.08ms\n └ order     product.v1.StockService/Confirm      5.14ms\n    └ product  product.v1.StockService/Confirm    4.13ms\n └ order     outbox publish order.events         30.38ms\n    └ marketplace  consume order.events            193µs\n```\n\nสองบรรทัดล่างคือส่วนที่ยากที่สุด — การ publish **ไม่ได้** เกิดระหว่าง request\nrequest เขียน event ลง outbox ใน transaction ของตัวเองแล้วจบไป\nจากนั้น relay เบื้องหลังค่อย publish ทีหลัง โดย trace context ถูกเก็บไว้ใน outbox row\nแล้ว relay ดึงกลับมาใช้ — event กับการสั่งซื้อที่เป็นต้นเหตุจึงอยู่ใน trace เดียวกัน\nแทนที่จะเป็น log สองกองที่ต้องเอา timestamp มาเทียบกันเอง\n\nชื่อ span เป็น route pattern (`POST /api/v1/orders/`) ไม่ใช่ path ดิบ —\nกฎ cardinality เดียวกับ label ของ Prometheus และเป็นเหตุผลที่ instrumentation\nฝั่ง HTTP ตรงนี้เขียนเองแทนที่จะใช้ `otelhttp`",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"items\": [\n    { \"product_id\": \"{{productId}}\", \"quantity\": 1 }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201\", () => pm.response.to.have.status(201));",
+                  "console.log(\"Jaeger → Service: order → Find Traces\");"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "10 · Cleanup  (destructive — runs last)",
+      "description": "**EN** — The two requests that destroy what the rest of the collection built. They live\nhere rather than in folders 02 and 04 for one reason: **the Collection Runner\nexecutes every request in order**, so \"skip this one\" written in a description\nis a wish, not a safeguard. Deleting the product mid-flow would break folder 05,\nand deleting the account would break folder 08.\n\nBoth are safe to run at the end, and safe to skip entirely.\n\n---\n\n**TH** — สอง request ที่ทำลายสิ่งที่ collection สร้างมาทั้งหมด — อยู่ตรงนี้แทนที่จะอยู่ใน folder 02 และ 04\nด้วยเหตุผลเดียว: **Collection Runner รันทุก request ตามลำดับ** ดังนั้นการเขียนว่า\n\"ข้ามอันนี้ไป\" ไว้ในคำอธิบาย เป็นแค่ความหวัง ไม่ใช่การป้องกัน\nถ้าลบสินค้ากลางทาง folder 05 จะพัง และถ้าลบบัญชี folder 08 จะพัง\n\nทั้งคู่รันตอนท้ายได้อย่างปลอดภัย และจะข้ามไปเลยก็ได้",
+      "item": [
+        {
+          "name": "Delete a product",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{productBase}}/api/v1/products/{{productId}}",
+              "host": [
+                "{{productBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "products",
+                "{{productId}}"
+              ]
+            },
+            "description": "**EN** — Owner only — somebody else's product answers 403.\n\n---\n\n**TH** — เฉพาะเจ้าของ — สินค้าของคนอื่นจะได้ 403"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Delete a user",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{userBase}}/api/v1/users/{{userId}}",
+              "host": [
+                "{{userBase}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "users",
+                "{{userId}}"
+              ]
+            },
+            "description": "**EN** — Self only, 403 otherwise. Deleting the account invalidates nothing about the token\nitself — a JWT is stateless and stays valid until it expires, which is the\ntrade a stateless token makes: no session lookup on every request, and no way\nto revoke one early without adding the lookup back.\n\n---\n\n**TH** — ลบได้เฉพาะตัวเอง ไม่งั้น 403 — การลบบัญชีไม่ได้ทำให้ token ใช้ไม่ได้ —\nJWT เป็น stateless ยังใช้ได้จนหมดอายุ ซึ่งคือสิ่งที่แลกมากับการใช้ token แบบ stateless:\nไม่ต้องค้น session ทุก request แต่ก็ไม่มีทางเพิกถอนก่อนหมดอายุ เว้นแต่จะเอาการค้นนั้นกลับมา"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"204 No Content\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

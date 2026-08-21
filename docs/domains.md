@@ -310,3 +310,15 @@ Copy an existing domain's shape rather than inventing a variation:
 
 If it needs facts from another domain, subscribe to that domain's events and
 keep a local read model. Do not add a call, and do not read its collections.
+
+## Diagrams
+
+Every endpoint in every domain is drawn in
+[sequence-diagrams/](sequence-diagrams/), in English and Thai. The topology on
+this page says which service talks to which; those say exactly how, including
+the parts that happen after the response has already been returned.
+
+- [The order saga](sequence-diagrams/order.md#-place-an-order--the-saga) — reserve, write, compensate
+- [The outbox and its relay](sequence-diagrams/cross-cutting.md#-the-outbox-and-its-relay)
+- [Reserving stock over gRPC and mutual TLS](sequence-diagrams/product.md#-reserve-stock-grpc--mutual-tls)
+- [A trace that survives the outbox](sequence-diagrams/cross-cutting.md#-a-trace-that-survives-the-outbox)

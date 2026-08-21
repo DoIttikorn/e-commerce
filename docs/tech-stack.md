@@ -70,6 +70,11 @@ after a consumer bug, and consumer-group scaling.
 Neither Redis nor Kafka has a Go client yet, on purpose. Both are wired when a
 domain needs them; a dependency with no caller is worse than no dependency.
 
+*Drawn: [sequence-diagrams/](sequence-diagrams/) has every endpoint as a UML
+sequence diagram, in English and Thai — including
+[the middleware chain](sequence-diagrams/cross-cutting.md#-the-middleware-chain)
+and [tracing across the outbox](sequence-diagrams/cross-cutting.md#-a-trace-that-survives-the-outbox).*
+
 ## Observability
 
 The job description asks for performance tuning, monitoring, troubleshooting,

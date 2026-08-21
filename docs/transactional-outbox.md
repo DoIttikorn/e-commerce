@@ -1,5 +1,7 @@
 # The transactional outbox
 
+*Drawn: [the outbox and its relay](sequence-diagrams/cross-cutting.md#-the-outbox-and-its-relay), and [a trace that survives it](sequence-diagrams/cross-cutting.md#-a-trace-that-survives-the-outbox).*
+
 *[อ่านฉบับภาษาไทย](transactional-outbox.th.md)*
 
 Why this codebase never publishes an event from a request path, and what it cost

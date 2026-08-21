@@ -65,6 +65,9 @@ is a failure in checkout.
 
 ## The engineering that is actually load-bearing
 
+*Each of the following is drawn as a UML sequence diagram in
+[sequence-diagrams/](sequence-diagrams/), English and Thai.*
+
 ### Placing an order is a saga, because a transaction is not available
 
 Stock lives in the Product service's database. The order lives in the Order

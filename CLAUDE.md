@@ -89,6 +89,14 @@ diagram, and UML sequence diagrams. Write a domain only after those exist for it
 and make the code follow them. **If a diagram and the code disagree, one of them
 is wrong — say so rather than quietly implementing something else.**
 
+**[docs/sequence-diagrams/](docs/sequence-diagrams/) is the full set** — every
+endpoint of all six domains as a UML sequence diagram, 42 per language, English
+and Thai (`x.md` / `x.th.md`, the same convention the outbox docs use). A diagram
+and the code disagreeing means one of them is wrong, so a change to a flow
+changes **both language files** with it. Validate with mermaid's own parser
+rather than by eye — two blocks shipped broken because a semicolon in note text
+is a statement separator in mermaid.
+
 Done so far:
 
 - [docs/user-domain-design.md](docs/user-domain-design.md) — the User domain:
@@ -498,6 +506,12 @@ be broken:
 Decided in `test/http/api.http`, which holds the full request collection and
 doubles as the brief's "sample API requests and responses" deliverable. Keep the
 two in step: change the contract there and here together.
+
+`postman/` carries the same contract as an importable Postman collection covering
+all six services, bilingual EN/TH per request, and it is **runnable**: the whole
+thing passes in the Runner. Verify with
+`npx newman run postman/e-commerce.postman_collection.json -e postman/e-commerce.postman_environment.json`.
+Three artefacts now describe one contract — change one, change all three.
 
 | Method | Path | Auth |
 |---|---|---|

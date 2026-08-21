@@ -1,5 +1,7 @@
 # User domain — design
 
+*The four diagrams here are the originals. The full set for every endpoint, in English and Thai, is in [sequence-diagrams/user.md](sequence-diagrams/user.md).*
+
 Design artefacts for the User domain, written before the code so the
 implementation follows them rather than the other way round. Requirements come
 from [README-2.md](../README-2.md).

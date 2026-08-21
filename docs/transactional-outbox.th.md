@@ -1,5 +1,7 @@
 # Transactional outbox
 
+*ดูรูป: [outbox และ relay ของมัน](sequence-diagrams/cross-cutting.th.md#-outbox-และ-relay-ของมัน) และ [trace ที่รอดข้าม outbox](sequence-diagrams/cross-cutting.th.md#-trace-ที่รอดข้าม-outbox)*
+
 *[Read this in English](transactional-outbox.md)*
 
 ทำไมไม่มี service ไหนในโปรเจคนี้ publish event จาก request path เลย และการทำแบบนั้นแลกมาด้วยอะไร
